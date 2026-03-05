@@ -224,7 +224,6 @@ def save_window_config(cfg):
 
 
 def get_screen_size():
-    """Baca resolusi layar aktual via wm size"""
     out = run_root_cmd("wm size")
     for line in out.splitlines():
         if "x" in line:
@@ -234,67 +233,74 @@ def get_screen_size():
                 return int(w.strip()), int(h.strip())
             except:
                 pass
-    return 1080, 2400
+    return 1080, 2340
 
 
 def get_running_roblox_tasks():
     """
-    Ambil task ID Roblox yang benar.
+    Return list of (task_id, stack_id) untuk semua Roblox yang running.
     Format dumpsys:
-      * Recent #2: TaskRecord{ab0Db6c #10805 A=com.roblox.clienu ...}
-    Task ID asli = angka setelah # di dalam TaskRecord{...}, bukan nomor Recent.
+      * Recent #2: TaskRecord{ab0Ob6c #10805 A=com.roblox.clienu U=0 StackId=23 sz=1}
     """
     pkgs = load_packages()
     pkg_list = list(pkgs.keys())
-    tasks = []
+    results = []  # list of (task_id, stack_id)
 
     out = run_root_cmd("dumpsys activity recents")
     if not out:
         out = run_root_cmd("dumpsys activity tasks")
 
-    current_task_id = None
     for line in out.splitlines():
-        line_stripped = line.strip()
-
-        # Baris TaskRecord mengandung task ID asli: TaskRecord{hex #ID A=pkg...}
-        if "TaskRecord{" in line_stripped or "Task{" in line_stripped:
-            try:
-                # Ambil bagian dalam kurung kurawal
-                inner = line_stripped.split("{")[1].split("}")[0]
-                # Format: "ab0Db6c #10805 A=com.roblox..."
-                parts = inner.split()
-                for part in parts:
-                    if part.startswith("#"):
-                        current_task_id = int(part[1:])
-                        break
-            except:
-                current_task_id = None
-
+        line = line.strip()
+        if "TaskRecord{" not in line and "Task{" not in line:
+            continue
         # Cek apakah baris ini mengandung package Roblox
-        # (bisa di baris TaskRecord sendiri atau baris affinity= di bawahnya)
-        if current_task_id is not None:
-            for pkg in pkg_list:
-                if pkg in line_stripped:
-                    tasks.append(current_task_id)
-                    current_task_id = None
-                    break
+        is_roblox = any(pkg in line for pkg in pkg_list)
+        if not is_roblox:
+            continue
+        try:
+            inner = line.split("{")[1].split("}")[0]
+            # inner: "ab0Ob6c #10805 A=com.roblox.clienu U=0 StackId=23 sz=1"
+            parts = inner.split()
+            task_id = None
+            stack_id = None
+            for part in parts:
+                if part.startswith("#") and task_id is None:
+                    task_id = int(part[1:])
+                if part.startswith("StackId="):
+                    stack_id = int(part.split("=")[1])
+            if task_id:
+                results.append((task_id, stack_id))
+        except:
+            pass
 
-    result = list(set(t for t in tasks if t and t > 0))
-    add_log(f"[Grid] Tasks: {result}")
-    return result
+    add_log(f"[Grid] Tasks: {[(t,s) for t,s in results]}")
+    return results
 
 
-def resize_task(task_id, x, y, w, h):
-    """Resize + reposition freeform window"""
-    right = x + w
+def resize_window(task_id, stack_id, x, y, w, h):
+    """
+    Resize freeform window — coba semua method yang tersedia.
+    Android 9-13 support berbeda-beda.
+    """
+    right  = x + w
     bottom = y + h
-    # Set freeform mode dulu
-    run_root_cmd(f"cmd activity set-task-windowing-mode {task_id} 5 true")
-    time.sleep(0.05)
-    # Resize dengan bounds (mode 5 = freeform)
+
+    # Method A: wm stack resize (pakai Stack ID) — paling reliable Android 9-11
+    if stack_id:
+        run_root_cmd(
+            f"wm stack resize {stack_id} {x} {y} {right} {bottom}"
+        )
+
+    # Method B: cmd activity resize-task (pakai Task ID) — Android 12+
     run_root_cmd(
         f"cmd activity resize-task {task_id} 5 "
         f"--bounds {x} {y} {right} {bottom}"
+    )
+
+    # Method C: syntax lama tanpa --bounds
+    run_root_cmd(
+        f"cmd activity resize-task {task_id} {x} {y} {right} {bottom}"
     )
 
 
@@ -314,12 +320,12 @@ def apply_grid_layout():
         add_log("[Grid] No window detected")
         return
 
-    for i, task in enumerate(tasks):
+    for i, (task_id, stack_id) in enumerate(tasks):
         row = i // per_row
         col = i % per_row
         x = col * width
         y = row * height
-        resize_task(task, x, y, width, height)
+        resize_window(task_id, stack_id, x, y, width, height)
         time.sleep(0.2)
 
     add_log(f"[Grid] ✅ {len(tasks)} windows, {per_row}/row, {width}x{height}")
@@ -334,9 +340,10 @@ def auto_fix_grid_loop():
             cfg = load_window_config()
             if cfg.get("enabled"):
                 tasks = get_running_roblox_tasks()
-                if sorted(tasks) != sorted(last_tasks):
+                ids = [t for t, s in tasks]
+                if sorted(ids) != sorted(last_tasks):
                     apply_grid_layout()
-                    last_tasks = list(tasks)
+                    last_tasks = ids
         except Exception as e:
             add_log(f"[Grid] loop error: {e}")
         time.sleep(4)
@@ -1903,7 +1910,7 @@ def menu():
         print("9. 🗂️ Copy ALL Cache Files to ALL Packages")
         print("10. 📊 View Cache Folder Status")
         print("11. 🪟 Configure Roblox Window Grid")
-        print("12. 🔍 Debug Grid (lihat task ID)")
+        print("12. 🔍 Debug Grid (lihat task/stack ID)")
         print("-" * 40)
         print("0. ❌ Exit\n")
         
@@ -2004,14 +2011,16 @@ def menu():
             print("🔍 DEBUG GRID")
             print("=" * 60)
             sw, sh = get_screen_size()
-            print(f"Screen: {sw}x{sh}")
+            print(f"Screen : {sw}x{sh}")
             tasks = get_running_roblox_tasks()
-            print(f"Task IDs: {tasks}")
+            print(f"Tasks  : {tasks}")
             print()
-            out = run_root_cmd("dumpsys activity recents")
-            for line in out.splitlines()[:60]:
-                if any(x in line for x in ["TaskRecord","Task{","affinity","stackId","#10"]):
-                    print(line)
+            # Test resize 1 window ke pojok kiri atas
+            if tasks:
+                tid, sid = tasks[0]
+                print(f"Testing resize task={tid} stack={sid} → 0,0,400,300")
+                resize_window(tid, sid, 0, 0, 400, 300)
+                print("Done - cek apakah window bergerak")
             input("\nPress ENTER...")
         elif c == "0": 
             break
