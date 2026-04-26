@@ -1513,18 +1513,40 @@ def backup_webview_from_pkg(package):
     run_root_cmd(f"cp -a {src_dir} {BACKUP_DIR}/app_webview")
 
     # Copy appStorage.json jika ada
-    if run_root_cmd(f"ls {app_storage}"):
-        run_root_cmd(f"cp -a {app_storage} {backup_app_storage}")
+    print(f"  Checking appStorage.json at: {app_storage}")
+    app_storage_check = run_root_cmd(f"ls {app_storage}")
+    if app_storage_check:
+        print(f"  Found! Copying...")
+        run_root_cmd(f"cp {app_storage} {backup_app_storage}")
+        run_root_cmd(f"chmod 666 {backup_app_storage}")
     else:
-        add_log(f"⚠️ appStorage.json not found in {package}, skipped")
+        # Coba cari di package lain yang punya appStorage.json
+        print(f"  Not found in {package}, searching other packages...")
+        pkgs = load_packages()
+        found_app_storage = False
+        for other_pkg in pkgs:
+            if other_pkg == package:
+                continue
+            other_path = get_app_storage_path(other_pkg)
+            if run_root_cmd(f"ls {other_path}"):
+                print(f"  Found in {other_pkg}! Copying...")
+                run_root_cmd(f"cp {other_path} {backup_app_storage}")
+                run_root_cmd(f"chmod 666 {backup_app_storage}")
+                found_app_storage = True
+                break
+        if not found_app_storage:
+            print(f"  ⚠️ appStorage.json not found in any package")
 
-    # Set permission agar bisa dibaca
+    # Set permission agar bisa dibaca oleh Python
     run_root_cmd(f"chmod -R 777 {BACKUP_DIR}")
 
     # Verify
     check = run_root_cmd(f"ls {BACKUP_DIR}/app_webview/Default/Cookies")
+    check_app = os.path.exists(backup_app_storage)
     if check:
-        add_log(f"✅ Backup saved to {BACKUP_DIR}/app_webview/")
+        print(f"\n  ✅ Backup saved:")
+        print(f"     Cookies.db: ✅")
+        print(f"     appStorage.json: {'✅' if check_app else '❌ MISSING'}")
         return True
     else:
         add_log(f"❌ Backup failed")
@@ -1710,7 +1732,10 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
     # Step 2: Copy Cookies.db → edit → timpa
     print(f"    [6] Copying Cookies.db to tmp...", end=" ", flush=True)
     try:
-        shutil.copy2(backup_db, tmp_db)
+        # Pakai binary read/write — hindari permission error dari shutil.copy2
+        with open(backup_db, "rb") as src:
+            with open(tmp_db, "wb") as dst:
+                dst.write(src.read())
         print(f"OK ({os.path.getsize(tmp_db)}b)")
     except Exception as e:
         print(f"❌ {e}")
@@ -1750,7 +1775,9 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
     if os.path.exists(backup_app_storage):
         print(f"    [9] Copying appStorage.json to tmp...", end=" ", flush=True)
         try:
-            shutil.copy2(backup_app_storage, tmp_app_storage)
+            with open(backup_app_storage, "rb") as src:
+                with open(tmp_app_storage, "wb") as dst:
+                    dst.write(src.read())
             print(f"OK")
         except Exception as e:
             print(f"❌ {e}")
