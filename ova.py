@@ -349,17 +349,48 @@ def get_roblox_packages():
     return pkgs
 
 def get_username_from_prefs(package):
+    """Coba dapatkan username dari berbagai sumber"""
+    # Method 1: prefs.xml (cara lama)
     prefs = f"/data/data/{package}/shared_prefs/prefs.xml"
     xml = run_root_cmd(f"cat {prefs}")
-    if not xml:
-        return None
-    try:
-        root = ET.fromstring(xml)
-        for c in root:
-            if c.tag == "string" and c.attrib.get("name") == "username":
-                return c.text.strip() if c.text else None
-    except Exception as e:
-        add_log(f"Prefs parse error {package}: {e}")
+    if xml:
+        try:
+            root = ET.fromstring(xml)
+            for c in root:
+                if c.tag == "string" and c.attrib.get("name") == "username":
+                    if c.text and c.text.strip():
+                        return c.text.strip()
+        except Exception as e:
+            add_log(f"Prefs parse error {package}: {e}")
+
+    # Method 2: Cek cookie DB untuk username via .RBXIDCHECK
+    cookie_db = f"/data/data/{package}/app_webview/Default/Cookies"
+    tmp_db = f"/data/local/tmp/check_user_{package.split('.')[-1]}.db"
+    check = run_root_cmd(f"ls {cookie_db}")
+    if check:
+        try:
+            run_root_cmd(f"cp {cookie_db} {tmp_db}")
+            run_root_cmd(f"chmod 666 {tmp_db}")
+            conn = sqlite3.connect(tmp_db)
+            c = conn.cursor()
+            # Cek apakah ada .ROBLOSECURITY cookie (artinya pernah login)
+            c.execute("SELECT length(value) FROM cookies WHERE name='.ROBLOSECURITY' AND host_key='.roblox.com'")
+            row = c.fetchone()
+            conn.close()
+            run_root_cmd(f"rm {tmp_db}")
+            if row and row[0] > 0:
+                # Ada cookie, pakai nama package sebagai identifier
+                pkg_suffix = package.split('.')[-1]
+                return f"account_{pkg_suffix}"
+        except Exception:
+            run_root_cmd(f"rm {tmp_db}")
+
+    # Method 3: Cek apakah app pernah dijalankan (ada data)
+    has_data = run_root_cmd(f"ls /data/data/{package}/app_webview/")
+    if has_data:
+        pkg_suffix = package.split('.')[-1]
+        return f"pkg_{pkg_suffix}"
+
     return None
 
 def auto_detect_and_save_packages():
@@ -373,40 +404,43 @@ def auto_detect_and_save_packages():
     for pkg in pkgs:
         print(f"Checking {pkg}...", end=" ")
         user = get_username_from_prefs(pkg)
-        if user:
-            # ArceusX menggunakan global workspace/autoexec
-            if EXECUTOR_TYPE == "arceusx":
-                package_info = {
-                    "username": user,
-                    "package_name": pkg,
-                    "workspace_dir": "/storage/emulated/0/Arceus X/Workspace",
-                    "autoexec_dir": "/storage/emulated/0/Arceus X/Autoexecute",
-                    "cache_dir": None,  # ArceusX tidak butuh cache
-                    "license_path": None
-                }
-            elif EXECUTOR_TYPE == "ronix":
-                package_info = {
-                    "username": user,
-                    "package_name": pkg,
-                    "workspace_dir": "/storage/emulated/0/RonixExploit/workspace",
-                    "autoexec_dir": "/storage/emulated/0/RonixExploit/autoexecute",
-                    "cache_dir": None,  # RonixExploit tidak butuh cache
-                    "license_path": None
-                }
-            else:
-                # Delta Executor (default)
-                package_info = {
-                    "username": user,
-                    "package_name": pkg,
-                    "workspace_dir": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Workspace",
-                    "autoexec_dir": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Autoexecute",
-                    "cache_dir": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Internals/Cache",
-                    "license_path": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Internals/Cache"
-                }
-            saved[pkg] = package_info
-            print(f"{user} ✓")
+
+        # Kalau username tidak ditemukan, tetap simpan dengan nama dari package
+        if not user:
+            pkg_suffix = pkg.split('.')[-1]
+            user = f"pkg_{pkg_suffix}"
+
+        # ArceusX menggunakan global workspace/autoexec
+        if EXECUTOR_TYPE == "arceusx":
+            package_info = {
+                "username": user,
+                "package_name": pkg,
+                "workspace_dir": "/storage/emulated/0/Arceus X/Workspace",
+                "autoexec_dir": "/storage/emulated/0/Arceus X/Autoexecute",
+                "cache_dir": None,
+                "license_path": None
+            }
+        elif EXECUTOR_TYPE == "ronix":
+            package_info = {
+                "username": user,
+                "package_name": pkg,
+                "workspace_dir": "/storage/emulated/0/RonixExploit/workspace",
+                "autoexec_dir": "/storage/emulated/0/RonixExploit/autoexecute",
+                "cache_dir": None,
+                "license_path": None
+            }
         else:
-            print("SKIP")
+            # Delta Executor (default)
+            package_info = {
+                "username": user,
+                "package_name": pkg,
+                "workspace_dir": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Workspace",
+                "autoexec_dir": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Autoexecute",
+                "cache_dir": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Internals/Cache",
+                "license_path": f"/storage/emulated/0/Android/data/{pkg}/files/gloop/external/Internals/Cache"
+            }
+        saved[pkg] = package_info
+        print(f"{user} ✓")
 
     if saved:
         with open(PACKAGES_FILE, "w") as f:
@@ -436,8 +470,10 @@ def auto_setup_wizard():
     
     for pkg in pkgs_found:
         user = get_username_from_prefs(pkg)
-        if user:
-            detected[pkg] = {"username": user}
+        if not user:
+            pkg_suffix = pkg.split('.')[-1]
+            user = f"pkg_{pkg_suffix}"
+        detected[pkg] = {"username": user}
     
     if not detected:
         print("\n❌ No Roblox packages found!")
@@ -1283,53 +1319,108 @@ def get_pkg_owner(package):
             return f"{parts[2]}:{parts[3]}"
     return None
 
-def inject_cookie_to_pkg(package, cookie):
-    """
-    Inject .ROBLOSECURITY cookie ke Roblox package via SQLite.
-    1. Force stop app
-    2. Copy DB ke /data/local/tmp
-    3. Python sqlite3 DELETE + INSERT
-    4. Copy back + fix permissions
-    """
-    db_path = get_cookie_db_path(package)
-    tmp_db = f"/data/local/tmp/cookies_{package.split('.')[-1]}.db"
+BACKUP_DIR = "/sdcard/download/bangova"
 
-    # Cek DB exists
-    check = run_root_cmd(f"ls {db_path}")
+def backup_webview_from_pkg(package):
+    """
+    Backup seluruh app_webview/ dari package ke /sdcard/download/bangova/
+    Cukup dilakukan 1x dari package yang sudah login.
+    """
+    src_dir = f"/data/data/{package}/app_webview"
+    
+    # Cek source ada
+    check = run_root_cmd(f"ls {src_dir}/Default/Cookies")
     if not check:
-        add_log(f"❌ Cookie DB not found for {package}")
-        add_log(f"   App mungkin belum pernah dibuka. Buka manual dulu 1x.")
+        add_log(f"❌ {package} tidak punya webview data")
         return False
 
-    # Step 1: Force stop
-    add_log(f"⏹️ Stopping {package}...")
-    run_root_cmd(f"am force-stop {package}")
-    time.sleep(1)
+    # Buat folder backup
+    run_root_cmd(f"mkdir -p {BACKUP_DIR}")
 
-    # Step 2: Copy DB ke tmp
-    run_root_cmd(f"cp {db_path} {tmp_db}")
-    run_root_cmd(f"chmod 666 {tmp_db}")
+    # Hapus backup lama
+    run_root_cmd(f"rm -rf {BACKUP_DIR}/app_webview")
 
-    # Cek tmp file
-    if not run_root_cmd(f"ls {tmp_db}"):
-        add_log(f"❌ Failed to copy DB to tmp")
+    # Copy seluruh folder
+    add_log(f"📦 Backing up webview data from {package}...")
+    run_root_cmd(f"cp -a {src_dir} {BACKUP_DIR}/app_webview")
+
+    # Set permission agar bisa dibaca
+    run_root_cmd(f"chmod -R 777 {BACKUP_DIR}")
+
+    # Verify
+    check = run_root_cmd(f"ls {BACKUP_DIR}/app_webview/Default/Cookies")
+    if check:
+        add_log(f"✅ Backup saved to {BACKUP_DIR}/app_webview/")
+        return True
+    else:
+        add_log(f"❌ Backup failed")
         return False
 
-    # Step 3: Python sqlite3 inject
+def has_backup():
+    """Cek apakah backup bangova sudah ada"""
+    check = run_root_cmd(f"ls {BACKUP_DIR}/app_webview/Default/Cookies")
+    return bool(check)
+
+def restore_webview_to_pkg(dest_pkg):
+    """Restore backup app_webview/ dari bangova ke package"""
+    src_dir = f"{BACKUP_DIR}/app_webview"
+    dst_dir = f"/data/data/{dest_pkg}/app_webview"
+
+    if not has_backup():
+        add_log(f"❌ Backup tidak ditemukan di {BACKUP_DIR}")
+        return False
+
+    # Hapus webview lama di dest
+    run_root_cmd(f"rm -rf {dst_dir}")
+
+    # Copy dari backup
+    run_root_cmd(f"cp -a {src_dir} {dst_dir}")
+
+    # Fix ownership
+    owner = get_pkg_owner(dest_pkg)
+    if owner:
+        run_root_cmd(f"chown -R {owner} {dst_dir}")
+
+    # Verify
+    check = run_root_cmd(f"ls {dst_dir}/Default/Cookies")
+    if check:
+        return True
+    else:
+        add_log(f"❌ Restore failed for {dest_pkg}")
+        return False
+
+def find_source_package():
+    """Cari package yang sudah login (punya Cookie DB dengan .ROBLOSECURITY)"""
+    pkgs = load_packages()
+    for pkg, info in pkgs.items():
+        db_path = get_cookie_db_path(pkg)
+        check = run_root_cmd(f"ls {db_path}")
+        if check:
+            return pkg
+    all_pkgs = get_roblox_packages()
+    for pkg in all_pkgs:
+        db_path = get_cookie_db_path(pkg)
+        check = run_root_cmd(f"ls {db_path}")
+        if check:
+            return pkg
+    return None
+
+def inject_cookie_to_db(db_path, cookie):
+    """Inject cookie ke SQLite database yang sudah ada di tmp"""
     try:
-        conn = sqlite3.connect(tmp_db)
+        conn = sqlite3.connect(db_path)
         c = conn.cursor()
 
-        # Cek schema - apakah tabel cookies ada
+        # Cek tabel cookies ada
         c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cookies'")
         if not c.fetchone():
-            add_log(f"❌ Table 'cookies' not found in DB")
+            add_log(f"❌ Table 'cookies' not found")
             conn.close()
             return False
 
         # Timestamps (microseconds)
         now = int(time.time() * 1_000_000)
-        expires = int((time.time() + 86400 * 365) * 1_000_000)  # 1 tahun
+        expires = int((time.time() + 86400 * 365) * 1_000_000)
 
         # Delete existing .ROBLOSECURITY
         c.execute("DELETE FROM cookies WHERE host_key='.roblox.com' AND name='.ROBLOSECURITY'")
@@ -1343,26 +1434,13 @@ def inject_cookie_to_pkg(package, cookie):
                 is_persistent, priority, encrypted_value, samesite, source_scheme
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            now,                # creation_utc
-            ".roblox.com",      # host_key
-            ".ROBLOSECURITY",   # name
-            cookie,             # value
-            "/",                # path
-            expires,            # expires_utc
-            1,                  # is_secure
-            1,                  # is_httponly
-            now,                # last_access_utc
-            1,                  # has_expires
-            1,                  # is_persistent
-            1,                  # priority
-            b"",                # encrypted_value (kosong)
-            -1,                 # samesite
-            0                   # source_scheme
+            now, ".roblox.com", ".ROBLOSECURITY", cookie, "/", expires,
+            1, 1, now, 1, 1, 1, b"", -1, 0
         ))
 
         conn.commit()
         conn.close()
-        add_log(f"✅ Cookie injected to tmp DB")
+        return True
 
     except Exception as e:
         add_log(f"❌ SQLite error: {e}")
@@ -1372,17 +1450,89 @@ def inject_cookie_to_pkg(package, cookie):
             pass
         return False
 
+def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", private_link=""):
+    """
+    Inject .ROBLOSECURITY cookie ke Roblox package.
+    Strategy:
+    1. Kalau package sudah punya Cookie DB → langsung inject
+    2. Kalau belum → clone dari package yang sudah login, lalu ganti cookie
+    3. Launch app setelah inject
+    """
+    db_path = get_cookie_db_path(package)
+    tmp_db = f"/data/local/tmp/cookies_{package.split('.')[-1]}.db"
+
+    # Step 1: Force stop
+    add_log(f"⏹️ Stopping {package}...")
+    run_root_cmd(f"am force-stop {package}")
+    time.sleep(2)
+
+    # Step 2: Cek apakah package sudah punya Cookie DB
+    has_db = run_root_cmd(f"ls {db_path}")
+
+    if not has_db:
+        # Package belum punya DB — restore dari backup bangova
+        if has_backup():
+            add_log(f"📋 Restoring webview data from backup...")
+            if not restore_webview_to_pkg(package):
+                return False
+        else:
+            # Tidak ada backup — coba clone dari package lain yang sudah login
+            source_pkg = find_source_package()
+            if source_pkg:
+                add_log(f"📋 No backup found, cloning from {source_pkg}...")
+                src_dir = f"/data/data/{source_pkg}/app_webview"
+                dst_dir = f"/data/data/{package}/app_webview"
+                run_root_cmd(f"rm -rf {dst_dir}")
+                run_root_cmd(f"cp -a {src_dir} {dst_dir}")
+                owner = get_pkg_owner(package)
+                if owner:
+                    run_root_cmd(f"chown -R {owner} {dst_dir}")
+            else:
+                # Tidak ada source sama sekali — launch app dulu
+                add_log(f"⚠️ No backup & no source, launching {package} to create DB...")
+                splash = f"am start -n {package}/com.roblox.client.startup.ActivitySplash"
+                run_root_cmd(splash)
+                time.sleep(10)
+                run_root_cmd(f"am force-stop {package}")
+                time.sleep(2)
+                has_db = run_root_cmd(f"ls {db_path}")
+                if not has_db:
+                    add_log(f"❌ Failed to create DB for {package}")
+                    return False
+
+    # Step 3: Copy DB ke tmp, inject cookie, copy back
+    run_root_cmd(f"cp {db_path} {tmp_db}")
+    run_root_cmd(f"chmod 666 {tmp_db}")
+
+    if not run_root_cmd(f"ls {tmp_db}"):
+        add_log(f"❌ Failed to copy DB to tmp")
+        return False
+
+    if not inject_cookie_to_db(tmp_db, cookie):
+        run_root_cmd(f"rm {tmp_db}")
+        return False
+
+    add_log(f"✅ Cookie injected to tmp DB")
+
     # Step 4: Copy back + fix permissions
     owner = get_pkg_owner(package)
     run_root_cmd(f"cp {tmp_db} {db_path}")
     if owner:
         run_root_cmd(f"chown {owner} {db_path}")
     run_root_cmd(f"chmod 600 {db_path}")
-
-    # Cleanup tmp
     run_root_cmd(f"rm {tmp_db}")
 
     add_log(f"✅ Cookie injected to {package}")
+
+    # Step 5: Launch app
+    if launch_after:
+        add_log(f"🚀 Launching {package}...")
+        splash = f"am start -n {package}/com.roblox.client.startup.ActivitySplash"
+        run_root_cmd(splash)
+        time.sleep(8)
+        if game_id or private_link:
+            start_app_2step(package, game_id, private_link)
+
     return True
 
 def manage_cookies_menu():
@@ -1413,9 +1563,15 @@ def manage_cookies_menu():
             print("  (Belum ada cookie)")
         print()
 
+        # Backup status
+        backup_status = "✅ Ready" if has_backup() else "❌ Belum ada"
+        print(f"📦 Backup session: {backup_status} ({BACKUP_DIR})")
+        print()
+
         print("1. ➕ Add Cookie")
         print("2. 🗑️ Delete Cookie")
         print("3. ✅ Validate All Cookies")
+        print("4. 📦 Backup Session (dari package yang sudah login)")
         print("0. ↩️ Back\n")
 
         c = input("📌 Select: ").strip()
@@ -1518,6 +1674,56 @@ def manage_cookies_menu():
                     print("❌ Invalid / Expired")
             input("\nPress ENTER...")
 
+        elif c == "4":
+            # Backup session dari package yang sudah login
+            clear_screen()
+            print("=" * 70)
+            print("📦 BACKUP SESSION DATA")
+            print("=" * 70)
+            print()
+            print("Pilih package yang SUDAH LOGIN (punya akun Roblox aktif).")
+            print("Data session akan disimpan ke:", BACKUP_DIR)
+            print()
+
+            pkgs = load_packages()
+            if not pkgs:
+                print("❌ Belum ada package. Jalankan Auto Detect dulu.")
+                input("\nPress ENTER...")
+                continue
+
+            pkg_list = list(pkgs.items())
+            for i, (pkg, info) in enumerate(pkg_list):
+                username = info.get("username", "?")
+                db_check = run_root_cmd(f"ls /data/data/{pkg}/app_webview/Default/Cookies")
+                db_status = "✅ Has data" if db_check else "❌ No data"
+                print(f"  {i+1}. {username} ({pkg.split('.')[-1]}) — {db_status}")
+
+            print()
+            choice = input(f"📌 Pilih package (1-{len(pkg_list)}): ").strip()
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(pkg_list):
+                    pkg, info = pkg_list[idx]
+                    username = info.get("username", "?")
+                    print(f"\n📦 Backing up dari {username} ({pkg})...")
+
+                    # Force stop dulu
+                    run_root_cmd(f"am force-stop {pkg}")
+                    time.sleep(1)
+
+                    if backup_webview_from_pkg(pkg):
+                        print(f"\n✅ Backup berhasil!")
+                        print(f"📂 Lokasi: {BACKUP_DIR}/app_webview/")
+                        print(f"\nBackup ini akan dipakai otomatis saat Login Cookie")
+                        print(f"ke package yang belum punya data.")
+                    else:
+                        print(f"\n❌ Backup gagal!")
+                else:
+                    print("❌ Nomor tidak valid")
+            except ValueError:
+                print("❌ Input harus angka")
+            input("\nPress ENTER...")
+
         elif c == "0":
             break
 
@@ -1614,13 +1820,14 @@ def login_cookies_menu():
             input("\nPress ENTER...")
 
         elif c == "3":
-            # Login all
+            # Login all — inject + launch
             if not cmap:
                 print("\n❌ Belum ada cookie yang di-assign! Pilih opsi 1 atau 2 dulu.")
                 input("\nPress ENTER...")
                 continue
 
-            print("\n🚀 Injecting cookies ke semua package...\n")
+            cfg = load_config()
+            print("\n🚀 Injecting cookies + launching semua package...\n")
             success = 0
             fail = 0
             for pkg_idx_str, cookie_idx in cmap.items():
@@ -1633,34 +1840,40 @@ def login_cookies_menu():
                 pkg, info = pkg_list[pkg_idx]
                 username = info.get("username", "?")
                 cookie = cookies[cookie_idx]
+                game_id, private_link = get_pkg_launch_params(pkg, cfg)
 
                 print(f"  [{pkg_idx+1}] {username} ← Cookie #{cookie_idx+1}... ", end="", flush=True)
-                if inject_cookie_to_pkg(pkg, cookie):
-                    print("✅")
+                if inject_cookie_to_pkg(pkg, cookie, launch_after=True, game_id=game_id, private_link=private_link):
+                    print("✅ Injected + Launched")
                     success += 1
                 else:
                     print("❌")
                     fail += 1
 
+                # Delay antar package agar tidak overload
+                if success + fail < len(cmap):
+                    time.sleep(3)
+
             print(f"\n📊 Result: {success} success, {fail} failed")
             input("\nPress ENTER...")
 
         elif c == "4":
-            # Login satu package
+            # Login satu package — inject + launch
+            cfg = load_config()
             print()
             pkg_num = input(f"📦 Nomor package (1-{len(pkg_list)}): ").strip()
             try:
                 pkg_idx = int(pkg_num) - 1
                 if 0 <= pkg_idx < len(pkg_list):
-                    # Cek apakah sudah ada mapping
                     cookie_idx = cmap.get(str(pkg_idx))
                     if cookie_idx is not None and cookie_idx < len(cookies):
                         pkg, info = pkg_list[pkg_idx]
                         username = info.get("username", "?")
                         cookie = cookies[cookie_idx]
-                        print(f"\n🚀 Injecting Cookie #{cookie_idx+1} → {username}...")
-                        if inject_cookie_to_pkg(pkg, cookie):
-                            print("✅ Success!")
+                        game_id, private_link = get_pkg_launch_params(pkg, cfg)
+                        print(f"\n🚀 Injecting Cookie #{cookie_idx+1} → {username} + Launch...")
+                        if inject_cookie_to_pkg(pkg, cookie, launch_after=True, game_id=game_id, private_link=private_link):
+                            print("✅ Injected + Launched!")
                         else:
                             print("❌ Failed!")
                     else:
