@@ -1321,12 +1321,179 @@ def get_pkg_owner(package):
 
 BACKUP_DIR = "/sdcard/download/bangova"
 
+def get_app_storage_path(package):
+    """Return path ke appStorage.json untuk package"""
+    return f"/data/data/{package}/files/appData/LocalStorage/appStorage.json"
+
+def get_backup_app_storage_path():
+    """Return path backup appStorage.json"""
+    return f"{BACKUP_DIR}/appStorage.json"
+
+def update_app_storage(package, user_id, username, display_name):
+    """Update appStorage.json dengan data akun baru"""
+    app_storage_path = get_app_storage_path(package)
+    backup_app_storage = get_backup_app_storage_path()
+    tmp_path = f"/data/local/tmp/appStorage_{package.split('.')[-1]}.json"
+    owner = get_pkg_owner(package)
+
+    if not run_root_cmd(f"ls {app_storage_path}"):
+        if run_root_cmd(f"ls {backup_app_storage}"):
+            run_root_cmd(f"mkdir -p {os.path.dirname(app_storage_path)}")
+            run_root_cmd(f"cp -a {backup_app_storage} {app_storage_path}")
+            if owner:
+                run_root_cmd(f"chown {owner} {app_storage_path}")
+            run_root_cmd(f"chmod 660 {app_storage_path}")
+            add_log(f"📋 Restored appStorage.json from backup for {package}")
+        else:
+            add_log(f"⚠️ appStorage.json not found for {package}, skipped")
+            return True
+
+    run_root_cmd(f"cp {app_storage_path} {tmp_path}")
+    run_root_cmd(f"chmod 666 {tmp_path}")
+
+    if not run_root_cmd(f"ls {tmp_path}"):
+        add_log(f"❌ Failed to copy appStorage.json to tmp")
+        return False
+
+    try:
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        user_id_str = str(user_id)
+        username_str = str(username or "")
+        display_name_str = str(display_name or username or "")
+
+        old_user_id = str(data.get("UserId", ""))
+        old_username = str(data.get("Username", ""))
+        old_display_name = str(data.get("DisplayName", ""))
+        old_credential_value = str(data.get("CredentialValue", ""))
+
+        data["Username"] = username_str
+        data["UserId"] = user_id_str
+        data["DisplayName"] = display_name_str
+        data["CredentialValue"] = username_str
+
+        player_blob_raw = data.get("PlayerHydrationBlob")
+        if isinstance(player_blob_raw, str) and player_blob_raw.strip():
+            try:
+                player_blob = json.loads(player_blob_raw)
+                if isinstance(player_blob, dict):
+                    player_blob["userId"] = user_id_str
+                    if "displayName" in player_blob:
+                        player_blob["displayName"] = display_name_str
+                    if "name" in player_blob:
+                        player_blob["name"] = username_str
+                    if "username" in player_blob:
+                        player_blob["username"] = username_str
+                    data["PlayerHydrationBlob"] = json.dumps(player_blob, separators=(",", ":"))
+            except Exception:
+                updated_blob = player_blob_raw
+                if old_user_id:
+                    updated_blob = updated_blob.replace(f'"userId":"{old_user_id}"', f'"userId":"{user_id_str}"').replace(old_user_id, user_id_str)
+                if old_username:
+                    updated_blob = updated_blob.replace(old_username, username_str)
+                if old_display_name:
+                    updated_blob = updated_blob.replace(old_display_name, display_name_str)
+                data["PlayerHydrationBlob"] = updated_blob
+
+        app_config = data.get("AppConfiguration")
+        if isinstance(app_config, dict):
+            new_config = {}
+            for key, value in app_config.items():
+                new_key = key
+                if isinstance(key, str) and key.startswith("GUAC:") and ":app-policy" in key:
+                    parts = key.split(":")
+                    if len(parts) >= 3:
+                        parts[1] = user_id_str
+                        new_key = ":".join(parts)
+
+                if isinstance(value, str):
+                    updated_value = value
+                    if old_user_id:
+                        updated_value = updated_value.replace(old_user_id, user_id_str)
+                    new_config[new_key] = updated_value
+                else:
+                    new_config[new_key] = value
+            data["AppConfiguration"] = new_config
+        elif isinstance(app_config, str) and app_config:
+            if old_user_id:
+                data["AppConfiguration"] = app_config.replace(f"GUAC:{old_user_id}:app-policy", f"GUAC:{user_id_str}:app-policy").replace(old_user_id, user_id_str)
+
+        prev_accounts_raw = data.get("PreviousAccountsList")
+        if isinstance(prev_accounts_raw, str) and prev_accounts_raw.strip():
+            try:
+                prev_accounts = json.loads(prev_accounts_raw)
+                if isinstance(prev_accounts, list):
+                    for item in prev_accounts:
+                        if isinstance(item, dict):
+                            if "UserId" in item:
+                                item["UserId"] = user_id_str
+                            if "Username" in item:
+                                item["Username"] = username_str
+                            if "DisplayName" in item:
+                                item["DisplayName"] = display_name_str
+                            if "CredentialValue" in item:
+                                item["CredentialValue"] = username_str
+                    data["PreviousAccountsList"] = json.dumps(prev_accounts, separators=(",", ":"))
+            except Exception:
+                updated_prev = prev_accounts_raw
+                if old_user_id:
+                    updated_prev = updated_prev.replace(old_user_id, user_id_str)
+                if old_username:
+                    updated_prev = updated_prev.replace(old_username, username_str)
+                if old_display_name:
+                    updated_prev = updated_prev.replace(old_display_name, display_name_str)
+                if old_credential_value:
+                    updated_prev = updated_prev.replace(old_credential_value, username_str)
+                data["PreviousAccountsList"] = updated_prev
+
+        for key, value in list(data.items()):
+            if isinstance(value, str):
+                updated_value = value
+                if old_user_id:
+                    updated_value = updated_value.replace(old_user_id, user_id_str)
+                if old_username:
+                    updated_value = updated_value.replace(old_username, username_str)
+                if old_display_name:
+                    updated_value = updated_value.replace(old_display_name, display_name_str)
+                if old_credential_value:
+                    updated_value = updated_value.replace(old_credential_value, username_str)
+                data[key] = updated_value
+
+        data["Username"] = username_str
+        data["UserId"] = user_id_str
+        data["DisplayName"] = display_name_str
+        data["CredentialValue"] = username_str
+
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+
+    except Exception as e:
+        add_log(f"❌ appStorage update error: {e}")
+        run_root_cmd(f"rm {tmp_path}")
+        return False
+
+    run_root_cmd(f"cp {tmp_path} {app_storage_path}")
+    if owner:
+        run_root_cmd(f"chown {owner} {app_storage_path}")
+    run_root_cmd(f"chmod 660 {app_storage_path}")
+    run_root_cmd(f"rm {tmp_path}")
+
+    if not run_root_cmd(f"ls {app_storage_path}"):
+        add_log(f"❌ Failed to restore updated appStorage.json")
+        return False
+
+    add_log(f"✅ appStorage.json updated for {package}")
+    return True
+
 def backup_webview_from_pkg(package):
     """
     Backup seluruh app_webview/ dari package ke /sdcard/download/bangova/
     Cukup dilakukan 1x dari package yang sudah login.
     """
     src_dir = f"/data/data/{package}/app_webview"
+    app_storage = get_app_storage_path(package)
+    backup_app_storage = get_backup_app_storage_path()
     
     # Cek source ada
     check = run_root_cmd(f"ls {src_dir}/Default/Cookies")
@@ -1339,10 +1506,17 @@ def backup_webview_from_pkg(package):
 
     # Hapus backup lama
     run_root_cmd(f"rm -rf {BACKUP_DIR}/app_webview")
+    run_root_cmd(f"rm -f {backup_app_storage}")
 
     # Copy seluruh folder
     add_log(f"📦 Backing up webview data from {package}...")
     run_root_cmd(f"cp -a {src_dir} {BACKUP_DIR}/app_webview")
+
+    # Copy appStorage.json jika ada
+    if run_root_cmd(f"ls {app_storage}"):
+        run_root_cmd(f"cp -a {app_storage} {backup_app_storage}")
+    else:
+        add_log(f"⚠️ appStorage.json not found in {package}, skipped")
 
     # Set permission agar bisa dibaca
     run_root_cmd(f"chmod -R 777 {BACKUP_DIR}")
@@ -1365,6 +1539,9 @@ def restore_webview_to_pkg(dest_pkg):
     """Restore backup app_webview/ dari bangova ke package"""
     src_dir = f"{BACKUP_DIR}/app_webview"
     dst_dir = f"/data/data/{dest_pkg}/app_webview"
+    backup_app_storage = get_backup_app_storage_path()
+    dst_app_storage = get_app_storage_path(dest_pkg)
+    dst_local_storage_dir = os.path.dirname(dst_app_storage)
 
     if not has_backup():
         add_log(f"❌ Backup tidak ditemukan di {BACKUP_DIR}")
@@ -1380,6 +1557,14 @@ def restore_webview_to_pkg(dest_pkg):
     owner = get_pkg_owner(dest_pkg)
     if owner:
         run_root_cmd(f"chown -R {owner} {dst_dir}")
+
+    # Restore appStorage.json jika ada di backup
+    if run_root_cmd(f"ls {backup_app_storage}"):
+        run_root_cmd(f"mkdir -p {dst_local_storage_dir}")
+        run_root_cmd(f"cp -a {backup_app_storage} {dst_app_storage}")
+        if owner:
+            run_root_cmd(f"chown {owner} {dst_app_storage}")
+        run_root_cmd(f"chmod 660 {dst_app_storage}")
 
     # Verify
     check = run_root_cmd(f"ls {dst_dir}/Default/Cookies")
@@ -1459,7 +1644,20 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
     3. Launch app setelah inject
     """
     db_path = get_cookie_db_path(package)
+    app_storage_path = get_app_storage_path(package)
     tmp_db = f"/data/local/tmp/cookies_{package.split('.')[-1]}.db"
+
+    # Validasi cookie (non-blocking — kalau gagal tetap lanjut inject)
+    user_id = None
+    username = None
+    display_name = None
+    cookie_info = validate_cookie(cookie)
+    if cookie_info:
+        user_id, username = cookie_info
+        display_name = username
+        add_log(f"✅ Cookie valid: {username} (ID: {user_id})")
+    else:
+        add_log(f"⚠️ Cookie validation failed/skipped, injecting anyway...")
 
     # Step 1: Force stop
     add_log(f"⏹️ Stopping {package}...")
@@ -1484,14 +1682,21 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
                 dst_dir = f"/data/data/{package}/app_webview"
                 run_root_cmd(f"rm -rf {dst_dir}")
                 run_root_cmd(f"cp -a {src_dir} {dst_dir}")
+                src_app_storage = get_app_storage_path(source_pkg)
                 owner = get_pkg_owner(package)
+                if run_root_cmd(f"ls {src_app_storage}"):
+                    run_root_cmd(f"mkdir -p {os.path.dirname(app_storage_path)}")
+                    run_root_cmd(f"cp -a {src_app_storage} {app_storage_path}")
                 if owner:
                     run_root_cmd(f"chown -R {owner} {dst_dir}")
+                    if run_root_cmd(f"ls {app_storage_path}"):
+                        run_root_cmd(f"chown {owner} {app_storage_path}")
+                if run_root_cmd(f"ls {app_storage_path}"):
+                    run_root_cmd(f"chmod 660 {app_storage_path}")
             else:
                 # Tidak ada source sama sekali — launch app dulu
                 add_log(f"⚠️ No backup & no source, launching {package} to create DB...")
-                splash = f"am start -n {package}/com.roblox.client.startup.ActivitySplash"
-                run_root_cmd(splash)
+                start_app_2step(package, "")
                 time.sleep(10)
                 run_root_cmd(f"am force-stop {package}")
                 time.sleep(2)
@@ -1522,16 +1727,29 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
     run_root_cmd(f"chmod 600 {db_path}")
     run_root_cmd(f"rm {tmp_db}")
 
+    # Update appStorage.json hanya jika punya user info dari validasi
+    if user_id and username:
+        if not update_app_storage(package, user_id, username, display_name):
+            add_log(f"⚠️ appStorage update failed, but cookie injected")
+    else:
+        add_log(f"⚠️ Skipping appStorage update (no user info)")
+
     add_log(f"✅ Cookie injected to {package}")
 
-    # Step 5: Launch app
+    # Step 5: Launch app (hanya buka Roblox, tidak masuk game)
     if launch_after:
-        add_log(f"🚀 Launching {package}...")
-        splash = f"am start -n {package}/com.roblox.client.startup.ActivitySplash"
-        run_root_cmd(splash)
-        time.sleep(8)
-        if game_id or private_link:
-            start_app_2step(package, game_id, private_link)
+        add_log(f"🚀 Launching {package} (login only)...")
+        splash_cmds = [
+            f"am start -n {package}/com.roblox.client.startup.ActivitySplash",
+            f"am start -n {package}/.startup.ActivitySplash",
+            f"monkey -p {package} -c android.intent.category.LAUNCHER 1"
+        ]
+        for cmd in splash_cmds:
+            run_root_cmd(cmd)
+            time.sleep(3)
+            if is_app_running(package):
+                add_log(f"✅ {package} launched for login")
+                break
 
     return True
 
@@ -1820,13 +2038,12 @@ def login_cookies_menu():
             input("\nPress ENTER...")
 
         elif c == "3":
-            # Login all — inject + launch
+            # Login all — inject + launch (hanya buka app, tidak masuk game)
             if not cmap:
                 print("\n❌ Belum ada cookie yang di-assign! Pilih opsi 1 atau 2 dulu.")
                 input("\nPress ENTER...")
                 continue
 
-            cfg = load_config()
             print("\n🚀 Injecting cookies + launching semua package...\n")
             success = 0
             fail = 0
@@ -1840,10 +2057,9 @@ def login_cookies_menu():
                 pkg, info = pkg_list[pkg_idx]
                 username = info.get("username", "?")
                 cookie = cookies[cookie_idx]
-                game_id, private_link = get_pkg_launch_params(pkg, cfg)
 
                 print(f"  [{pkg_idx+1}] {username} ← Cookie #{cookie_idx+1}... ", end="", flush=True)
-                if inject_cookie_to_pkg(pkg, cookie, launch_after=True, game_id=game_id, private_link=private_link):
+                if inject_cookie_to_pkg(pkg, cookie, launch_after=True):
                     print("✅ Injected + Launched")
                     success += 1
                 else:
@@ -1858,8 +2074,7 @@ def login_cookies_menu():
             input("\nPress ENTER...")
 
         elif c == "4":
-            # Login satu package — inject + launch
-            cfg = load_config()
+            # Login satu package — inject + launch (hanya buka app)
             print()
             pkg_num = input(f"📦 Nomor package (1-{len(pkg_list)}): ").strip()
             try:
@@ -1870,9 +2085,8 @@ def login_cookies_menu():
                         pkg, info = pkg_list[pkg_idx]
                         username = info.get("username", "?")
                         cookie = cookies[cookie_idx]
-                        game_id, private_link = get_pkg_launch_params(pkg, cfg)
                         print(f"\n🚀 Injecting Cookie #{cookie_idx+1} → {username} + Launch...")
-                        if inject_cookie_to_pkg(pkg, cookie, launch_after=True, game_id=game_id, private_link=private_link):
+                        if inject_cookie_to_pkg(pkg, cookie, launch_after=True):
                             print("✅ Injected + Launched!")
                         else:
                             print("❌ Failed!")
@@ -1963,10 +2177,27 @@ def start_app_2step(package, game_id, private_link=""):
     """
     import re
 
-    # Step 1: Splash
-    splash = f"am start -n {package}/com.roblox.client.startup.ActivitySplash"
-    run_root_cmd(splash)
-    time.sleep(10)
+    # Step 1: Splash / launcher fallback
+    splash_cmds = [
+        f"am start -n {package}/com.roblox.client.startup.ActivitySplash",
+        f"am start -n {package}/.startup.ActivitySplash",
+        f"monkey -p {package} -c android.intent.category.LAUNCHER 1"
+    ]
+
+    splash_started = False
+    for i, splash in enumerate(splash_cmds):
+        add_log(f"🚀 Launch attempt {i+1}: {splash[:60]}...")
+        run_root_cmd(splash)
+        time.sleep(3)
+        if is_app_running(package):
+            splash_started = True
+            add_log(f"✅ {package} started with method {i+1}")
+            break
+
+    if not splash_started:
+        add_log(f"⚠️ All splash methods tried for {package}, continuing anyway...")
+
+    time.sleep(8)
 
     # Step 2: Protocol launch
     if private_link:
