@@ -1640,9 +1640,12 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
     Inject .ROBLOSECURITY cookie ke Roblox package.
     Flow:
     1. Force stop app
-    2. Copy Cookies.db dari bangova → edit cookie → timpa ke pkg
-    3. Copy appStorage.json dari bangova → edit userId/username → timpa ke pkg
-    4. Launch app (hanya buka, tidak masuk game)
+    2. Copy Cookies.db dari bangova ke bangova/tmp/ → Python edit cookie → su cp ke pkg
+    3. Copy appStorage.json dari bangova ke bangova/tmp/ → Python edit → su cp ke pkg
+    4. Launch app (hanya buka home, tidak masuk game)
+
+    Semua edit dilakukan di /sdcard/download/bangova/tmp/ (Python bisa akses tanpa root)
+    Lalu hasilnya di-copy ke pkg pakai su -c (root)
     """
     if not has_backup():
         add_log(f"❌ Backup bangova belum ada! Jalankan Backup Session dulu (menu 13 → opsi 4)")
@@ -1652,8 +1655,13 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
     app_storage_path = get_app_storage_path(package)
     backup_db = f"{BACKUP_DIR}/app_webview/Default/Cookies"
     backup_app_storage = get_backup_app_storage_path()
-    tmp_db = f"/data/local/tmp/cookies_{package.split('.')[-1]}.db"
-    tmp_app_storage = f"/data/local/tmp/appStorage_{package.split('.')[-1]}.json"
+
+    # Folder tmp di sdcard (Python bisa baca/tulis tanpa root)
+    tmp_dir = f"{BACKUP_DIR}/tmp"
+    os.makedirs(tmp_dir, exist_ok=True)
+    pkg_short = package.split('.')[-1]
+    tmp_db = os.path.join(tmp_dir, f"Cookies_{pkg_short}.db")
+    tmp_app_storage = os.path.join(tmp_dir, f"appStorage_{pkg_short}.json")
 
     # Validasi cookie (non-blocking)
     user_id = None
@@ -1672,40 +1680,41 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
     run_root_cmd(f"am force-stop {package}")
     time.sleep(2)
 
-    # Step 2: Copy Cookies.db dari bangova → edit → timpa ke pkg
-    add_log(f"📋 Copying Cookies.db from backup...")
-    run_root_cmd(f"cp {backup_db} {tmp_db}")
-    run_root_cmd(f"chmod 666 {tmp_db}")
-
-    if not run_root_cmd(f"ls {tmp_db}"):
-        add_log(f"❌ Failed to copy backup Cookies.db")
+    # Step 2: Copy Cookies.db dari bangova → edit di sdcard → timpa ke pkg
+    add_log(f"📋 Editing Cookies.db...")
+    try:
+        shutil.copy2(backup_db, tmp_db)
+    except Exception as e:
+        add_log(f"❌ Failed to copy backup Cookies.db: {e}")
         return False
 
-    # Edit cookie di tmp
+    # Python edit cookie di sdcard (tidak perlu root)
     if not inject_cookie_to_db(tmp_db, cookie):
-        run_root_cmd(f"rm {tmp_db}")
+        os.remove(tmp_db)
         return False
-    add_log(f"✅ Cookie edited in tmp DB")
+    add_log(f"✅ Cookie edited")
 
-    # Timpa ke pkg
+    # Timpa ke pkg pakai root
     owner = get_pkg_owner(package)
-    dst_dir = f"/data/data/{package}/app_webview/Default"
-    run_root_cmd(f"mkdir -p {dst_dir}")
+    dst_webview = f"/data/data/{package}/app_webview/Default"
+    run_root_cmd(f"mkdir -p {dst_webview}")
     run_root_cmd(f"cp {tmp_db} {db_path}")
     if owner:
-        run_root_cmd(f"chown {owner} {db_path}")
+        run_root_cmd(f"chown -R {owner} /data/data/{package}/app_webview")
     run_root_cmd(f"chmod 600 {db_path}")
-    run_root_cmd(f"rm {tmp_db}")
-    add_log(f"✅ Cookies.db replaced in {package}")
+    os.remove(tmp_db)
+    add_log(f"✅ Cookies.db → {package}")
 
-    # Step 3: Copy appStorage.json dari bangova → edit → timpa ke pkg
-    if run_root_cmd(f"ls {backup_app_storage}"):
-        add_log(f"📋 Copying appStorage.json from backup...")
-        run_root_cmd(f"cp {backup_app_storage} {tmp_app_storage}")
-        run_root_cmd(f"chmod 666 {tmp_app_storage}")
+    # Step 3: Copy appStorage.json dari bangova → edit di sdcard → timpa ke pkg
+    if os.path.exists(backup_app_storage):
+        add_log(f"📋 Editing appStorage.json...")
+        try:
+            shutil.copy2(backup_app_storage, tmp_app_storage)
+        except Exception as e:
+            add_log(f"⚠️ Failed to copy backup appStorage: {e}")
+            tmp_app_storage = None
 
-        if user_id and username:
-            # Edit userId/username di tmp
+        if tmp_app_storage and user_id and username:
             try:
                 with open(tmp_app_storage, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -1716,21 +1725,21 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
                 old_display_name = str(data.get("DisplayName", ""))
                 old_credential = str(data.get("CredentialValue", ""))
 
-                # Update semua field string yang mengandung old values
+                # Replace semua old values di semua string fields
                 for key, value in list(data.items()):
                     if isinstance(value, str) and value:
                         updated = value
-                        if old_user_id and old_user_id != "-1":
+                        if old_user_id and old_user_id not in ("", "-1"):
                             updated = updated.replace(old_user_id, user_id_str)
                         if old_username:
                             updated = updated.replace(old_username, username)
                         if old_display_name and old_display_name != old_username:
                             updated = updated.replace(old_display_name, display_name)
-                        if old_credential and old_credential != old_username:
+                        if old_credential and old_credential not in ("", old_username):
                             updated = updated.replace(old_credential, username)
                         data[key] = updated
 
-                # Set field utama secara explicit (override)
+                # Override field utama
                 data["Username"] = username
                 data["UserId"] = user_id_str
                 data["DisplayName"] = display_name
@@ -1739,27 +1748,28 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
                 with open(tmp_app_storage, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
 
-                add_log(f"✅ appStorage.json edited: {username} (ID: {user_id_str})")
+                add_log(f"✅ appStorage edited: {username} (ID: {user_id_str})")
             except Exception as e:
                 add_log(f"⚠️ appStorage edit error: {e}, using backup as-is")
 
-        # Timpa ke pkg
-        app_storage_dir = os.path.dirname(app_storage_path)
-        run_root_cmd(f"mkdir -p {app_storage_dir}")
-        run_root_cmd(f"cp {tmp_app_storage} {app_storage_path}")
-        if owner:
-            run_root_cmd(f"chown {owner} {app_storage_path}")
-        run_root_cmd(f"chmod 660 {app_storage_path}")
-        run_root_cmd(f"rm {tmp_app_storage}")
-        add_log(f"✅ appStorage.json replaced in {package}")
+        # Timpa ke pkg pakai root
+        if tmp_app_storage and os.path.exists(tmp_app_storage):
+            app_storage_dir = os.path.dirname(app_storage_path)
+            run_root_cmd(f"mkdir -p {app_storage_dir}")
+            run_root_cmd(f"cp {tmp_app_storage} {app_storage_path}")
+            if owner:
+                run_root_cmd(f"chown {owner} {app_storage_path}")
+            run_root_cmd(f"chmod 660 {app_storage_path}")
+            os.remove(tmp_app_storage)
+            add_log(f"✅ appStorage.json → {package}")
     else:
         add_log(f"⚠️ No appStorage.json in backup, skipped")
 
-    add_log(f"✅ Cookie injected to {package}")
+    add_log(f"✅ Done: {package}")
 
-    # Step 4: Launch app (hanya buka Roblox, tidak masuk game)
+    # Step 4: Launch app (hanya buka Roblox home, tidak masuk game)
     if launch_after:
-        add_log(f"🚀 Launching {package} (login only)...")
+        add_log(f"🚀 Launching {package}...")
         splash_cmds = [
             f"am start -n {package}/com.roblox.client.startup.ActivitySplash",
             f"am start -n {package}/.startup.ActivitySplash",
@@ -1769,7 +1779,7 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
             run_root_cmd(cmd)
             time.sleep(3)
             if is_app_running(package):
-                add_log(f"✅ {package} launched for login")
+                add_log(f"✅ {package} launched")
                 break
 
     return True
