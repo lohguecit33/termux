@@ -12,11 +12,13 @@ from collections import deque
 # =========================
 # GLOBAL
 # =========================
-CONFIG_FILE = "config.json"
-PACKAGES_FILE = "packages.json"
-PKG_SERVERS_FILE = "pkg_servers.json"  # per-pkg server config: game_id atau private_link
-COOKIE_FILE = "cookie.txt"
-COOKIE_MAP_FILE = "cookie_map.json"  # mapping cookie index -> package
+# Semua file config/data disimpan di folder yang sama dengan ova.py
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+PACKAGES_FILE = os.path.join(SCRIPT_DIR, "packages.json")
+PKG_SERVERS_FILE = os.path.join(SCRIPT_DIR, "pkg_servers.json")  # per-pkg server config: game_id atau private_link
+COOKIE_FILE = os.path.join(SCRIPT_DIR, "cookie.txt")
+COOKIE_MAP_FILE = os.path.join(SCRIPT_DIR, "cookie_map.json")  # mapping cookie index -> package
 monitor_active = False
 EXECUTOR_TYPE = "delta"  # Executor type: delta or arceusx
 
@@ -1194,15 +1196,23 @@ def view_scripts_all_packages():
 # COOKIE MANAGEMENT
 # =========================
 def load_cookies():
-    """Baca cookie.txt, return list of cookie strings"""
+    """Baca cookie.txt, return list of cookie strings.
+    Support format manual: satu cookie per baris, abaikan baris kosong/komentar.
+    Handle BOM, \\r, spasi ekstra dari text editor Android."""
     if not os.path.exists(COOKIE_FILE):
         return []
     try:
-        with open(COOKIE_FILE, "r") as f:
+        with open(COOKIE_FILE, "r", encoding="utf-8-sig") as f:
             cookies = []
             for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
+                line = line.strip().replace("\r", "")
+                # Abaikan baris kosong, komentar, dan baris terlalu pendek
+                if not line or line.startswith("#"):
+                    continue
+                # Kalau ada spasi/tab di tengah cookie (copy-paste error), hapus
+                line = line.replace(" ", "").replace("\t", "")
+                # Minimal panjang cookie yang valid
+                if len(line) > 30:
                     cookies.append(line)
             return cookies
     except Exception as e:
