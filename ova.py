@@ -20,7 +20,11 @@ PKG_SERVERS_FILE = os.path.join(SCRIPT_DIR, "pkg_servers.json")  # per-pkg serve
 COOKIE_FILE = os.path.join(SCRIPT_DIR, "cookie.txt")
 COOKIE_MAP_FILE = os.path.join(SCRIPT_DIR, "cookie_map.json")  # mapping cookie index -> package
 monitor_active = False
-EXECUTOR_TYPE = "delta"  # Executor type: delta or arceusx
+EXECUTOR_TYPE = "delta"  # Executor type: delta, delta_global, arceusx, or ronix
+
+# Delta Global folder paths (1 shared folder, like Arceus X)
+DELTA_GLOBAL_AUTOEXEC = "/storage/emulated/0/Delta/Autoexecute"
+DELTA_GLOBAL_WORKSPACE = "/storage/emulated/0/Delta/Workspace"
 
 # Account state tracking (seperti PC version)
 ACCOUNT_STATE = {}  # pkg -> {launch_time, json_start_time, json_active, last_status}
@@ -305,7 +309,7 @@ def load_config():
         "webhook_enabled": True,
         "webhook_interval": 10,
         "restart_interval": 0,
-        "executor": "delta",  # delta or arceusx
+        "executor": "delta",  # delta, delta_global, arceusx, or ronix
         "freeform_enabled": False,
         "windows_per_row": 2,
         "use_fixed_size": False,
@@ -429,6 +433,15 @@ def auto_detect_and_save_packages():
                 "cache_dir": None,
                 "license_path": None
             }
+        elif EXECUTOR_TYPE == "delta_global":
+            package_info = {
+                "username": user,
+                "package_name": pkg,
+                "workspace_dir": DELTA_GLOBAL_WORKSPACE,
+                "autoexec_dir": DELTA_GLOBAL_AUTOEXEC,
+                "cache_dir": None,
+                "license_path": None
+            }
         else:
             # Delta Executor (default)
             package_info = {
@@ -514,14 +527,25 @@ def auto_setup_wizard():
     print("\n" + "=" * 70)
     print("⚡ Step 3/3: Choose Executor")
     print("-" * 70)
-    print("1. Delta Executor (default)")
-    print("2. Arceus X")
-    print("3. RonixExploit")
+    print("1. Delta Executor - Per Package (default)")
+    print("2. Delta Executor - Global Folder (1 folder shared, like Arceus X)")
+    print("3. Arceus X")
+    print("4. RonixExploit")
     print()
     
-    executor_choice = input("Select executor (1/2/3, default=1): ").strip()
+    executor_choice = input("Select executor (1/2/3/4, default=1): ").strip()
     
     if executor_choice == "2":
+        cfg["executor"] = "delta_global"
+        EXECUTOR_TYPE = "delta_global"
+        print("✅ Executor set to: Delta (Global Folder)")
+        print()
+        print("ℹ️  Delta Global Notes:")
+        print(f"   - All accounts share 1 folder")
+        print(f"   - Autoexec: {DELTA_GLOBAL_AUTOEXEC}")
+        print(f"   - Workspace: {DELTA_GLOBAL_WORKSPACE}")
+        print("   - Cache copy feature disabled")
+    elif executor_choice == "3":
         cfg["executor"] = "arceusx"
         EXECUTOR_TYPE = "arceusx"
         print("✅ Executor set to: Arceus X")
@@ -531,7 +555,7 @@ def auto_setup_wizard():
         print("   - Autoexec: /storage/emulated/0/Arceus X/Autoexecute")
         print("   - Workspace: /storage/emulated/0/Arceus X/Workspace")
         print("   - Cache copy feature disabled")
-    elif executor_choice == "3":
+    elif executor_choice == "4":
         cfg["executor"] = "ronix"
         EXECUTOR_TYPE = "ronix"
         print("✅ Executor set to: RonixExploit")
@@ -544,7 +568,7 @@ def auto_setup_wizard():
     else:
         cfg["executor"] = "delta"
         EXECUTOR_TYPE = "delta"
-        print("✅ Executor set to: Delta")
+        print("✅ Executor set to: Delta (Per Package)")
     
     save_config(cfg)
     
@@ -568,6 +592,15 @@ def auto_setup_wizard():
                 "package_name": pkg,
                 "workspace_dir": "/storage/emulated/0/RonixExploit/workspace",
                 "autoexec_dir": "/storage/emulated/0/RonixExploit/autoexecute",
+                "cache_dir": None,
+                "license_path": None
+            }
+        elif EXECUTOR_TYPE == "delta_global":
+            package_info = {
+                "username": user,
+                "package_name": pkg,
+                "workspace_dir": DELTA_GLOBAL_WORKSPACE,
+                "autoexec_dir": DELTA_GLOBAL_AUTOEXEC,
                 "cache_dir": None,
                 "license_path": None
             }
@@ -702,12 +735,17 @@ def copy_license_to_all_packages():
     global EXECUTOR_TYPE
     
     # Check executor type
-    if EXECUTOR_TYPE in ["arceusx", "ronix"]:
+    if EXECUTOR_TYPE in ["arceusx", "ronix", "delta_global"]:
         clear_screen()
         print("=" * 70)
         print("⚠️  CACHE COPY NOT AVAILABLE")
         print("=" * 70)
-        executor_name = "Arceus X" if EXECUTOR_TYPE == "arceusx" else "RonixExploit"
+        if EXECUTOR_TYPE == "arceusx":
+            executor_name = "Arceus X"
+        elif EXECUTOR_TYPE == "ronix":
+            executor_name = "RonixExploit"
+        else:
+            executor_name = "Delta (Global Folder)"
         print(f"\nCache copy feature is not available for {executor_name} executor.")
         print(f"{executor_name} uses global autoexec and workspace directories.")
         input("\nPress ENTER...")
@@ -925,8 +963,13 @@ def view_license_status():
     print("=" * 70)
     
     # Check executor type
-    if EXECUTOR_TYPE in ["arceusx", "ronix"]:
-        executor_name = "Arceus X" if EXECUTOR_TYPE == "arceusx" else "RonixExploit"
+    if EXECUTOR_TYPE in ["arceusx", "ronix", "delta_global"]:
+        if EXECUTOR_TYPE == "arceusx":
+            executor_name = "Arceus X"
+        elif EXECUTOR_TYPE == "ronix":
+            executor_name = "RonixExploit"
+        else:
+            executor_name = "Delta (Global Folder)"
         print(f"\n⚠️  Cache feature not available for {executor_name} executor")
         print(f"   {executor_name} uses global autoexec directory")
         input("\nPress ENTER...")
@@ -986,7 +1029,7 @@ def list_executor_scripts(package_info):
             scripts.append(os.path.basename(path.strip()))
         return sorted(scripts)
     else:
-        # Delta: gunakan Python biasa
+        # Delta (per-package) dan Delta Global: gunakan Python biasa
         if not os.path.exists(autoexec_dir):
             return []
         
@@ -1088,7 +1131,7 @@ def add_script_to_all_packages():
             add_log(f"✅ {info['username']}")
             success_count += 1
         else:
-            # Delta: gunakan Python biasa
+            # Delta (per-package) dan Delta Global: gunakan Python biasa
             if not os.path.exists(autoexec_dir):
                 try:
                     os.makedirs(autoexec_dir, exist_ok=True)
@@ -1183,7 +1226,7 @@ def delete_script_from_all_packages():
             else:
                 not_found_count += 1
         else:
-            # Delta: gunakan Python biasa
+            # Delta (per-package) dan Delta Global: gunakan Python biasa
             script_path = os.path.join(autoexec_dir, script_name)
             
             if os.path.exists(script_path):
@@ -1228,9 +1271,119 @@ def view_scripts_all_packages():
     print("\n" + "=" * 70)
     input("\nPress ENTER...")
 
-# =========================
-# COOKIE MANAGEMENT
-# =========================
+def view_workspace_files():
+    """Lihat file di folder Workspace (untuk executor dengan global folder)"""
+    global EXECUTOR_TYPE
+    
+    clear_screen()
+    print("=" * 70)
+    print("📂 VIEW WORKSPACE FILES")
+    print("=" * 70)
+    
+    # Tentukan workspace_dir berdasarkan executor
+    if EXECUTOR_TYPE == "delta_global":
+        workspace_dir = DELTA_GLOBAL_WORKSPACE
+        executor_name = "Delta (Global Folder)"
+    elif EXECUTOR_TYPE == "arceusx":
+        workspace_dir = "/storage/emulated/0/Arceus X/Workspace"
+        executor_name = "Arceus X"
+    elif EXECUTOR_TYPE == "ronix":
+        workspace_dir = "/storage/emulated/0/RonixExploit/workspace"
+        executor_name = "RonixExploit"
+    else:
+        # Delta per-package: tampilkan workspace per akun
+        pkgs = load_packages()
+        if not pkgs:
+            add_log("No packages found")
+            input("\nPress ENTER...")
+            return
+        for i, (pkg, info) in enumerate(pkgs.items(), 1):
+            ws_dir = info.get("workspace_dir", "")
+            print(f"\n{i}. {info['username']} - {ws_dir}")
+            if ws_dir and os.path.isdir(ws_dir):
+                try:
+                    files = os.listdir(ws_dir)
+                    if files:
+                        for f in sorted(files):
+                            fpath = os.path.join(ws_dir, f)
+                            size = os.path.getsize(fpath) if os.path.isfile(fpath) else 0
+                            print(f"   📄 {f} ({size} bytes)")
+                    else:
+                        print("   (Kosong)")
+                except Exception as e:
+                    print(f"   ❌ Error: {e}")
+            else:
+                print("   ❌ Folder tidak ditemukan")
+        print("\n" + "=" * 70)
+        input("\nPress ENTER...")
+        return
+    
+    print(f"\n⚡ Executor : {executor_name}")
+    print(f"📂 Workspace: {workspace_dir}")
+    print("-" * 70)
+    
+    if os.path.isdir(workspace_dir):
+        try:
+            files = os.listdir(workspace_dir)
+            if files:
+                print(f"\n📋 {len(files)} file(s) ditemukan:\n")
+                for f in sorted(files):
+                    fpath = os.path.join(workspace_dir, f)
+                    size = os.path.getsize(fpath) if os.path.isfile(fpath) else 0
+                    print(f"   📄 {f} ({size} bytes)")
+            else:
+                print("\n   (Folder kosong)")
+        except Exception as e:
+            print(f"\n   ❌ Error membaca folder: {e}")
+    else:
+        print(f"\n   ❌ Folder tidak ditemukan: {workspace_dir}")
+    
+    print("\n" + "=" * 70)
+    
+    # Tawarkan opsi tambah file ke workspace
+    print("\n📌 Options:")
+    print("  1. Copy file ke Workspace")
+    print("  2. Hapus file dari Workspace")
+    print("  Enter. Kembali")
+    
+    choice = input("\nPilih: ").strip()
+    
+    if choice == "1":
+        src_path = input("📌 Path file sumber: ").strip()
+        if src_path and os.path.isfile(src_path):
+            try:
+                os.makedirs(workspace_dir, exist_ok=True)
+                fname = os.path.basename(src_path)
+                dst = os.path.join(workspace_dir, fname)
+                shutil.copy2(src_path, dst)
+                add_log(f"✅ File '{fname}' berhasil dicopy ke Workspace")
+            except Exception as e:
+                add_log(f"❌ Error: {e}")
+        else:
+            add_log("❌ File tidak ditemukan")
+    elif choice == "2":
+        if os.path.isdir(workspace_dir):
+            try:
+                files = [f for f in os.listdir(workspace_dir) if os.path.isfile(os.path.join(workspace_dir, f))]
+                if files:
+                    for i, f in enumerate(sorted(files), 1):
+                        print(f"  {i}. {f}")
+                    fname_in = input("\n📌 Nama file yang dihapus: ").strip()
+                    if fname_in:
+                        fpath_del = os.path.join(workspace_dir, fname_in)
+                        if os.path.exists(fpath_del):
+                            os.remove(fpath_del)
+                            add_log(f"✅ File '{fname_in}' dihapus dari Workspace")
+                        else:
+                            add_log("❌ File tidak ditemukan")
+                else:
+                    add_log("Workspace kosong")
+            except Exception as e:
+                add_log(f"❌ Error: {e}")
+    
+    input("\nPress ENTER...")
+
+
 def load_cookies():
     """Baca cookie.txt, return list of cookie strings.
     Support format manual: satu cookie per baris, abaikan baris kosong/komentar.
@@ -1662,9 +1815,10 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
     Inject .ROBLOSECURITY cookie ke Roblox package.
     Flow:
     1. Force stop app
-    2. Copy Cookies.db dari bangova ke bangova/tmp/ → Python edit cookie → su cp ke pkg
-    3. Copy appStorage.json dari bangova ke bangova/tmp/ → Python edit → su cp ke pkg
-    4. Launch app (hanya buka home, tidak masuk game)
+    2. Copy SELURUH app_webview/ dari bangova ke pkg (termasuk LocalStorage, IndexedDB, dll)
+    3. Edit Cookies.db di bangova/tmp/ → timpa ke pkg
+    4. Copy appStorage.json dari bangova → edit → timpa ke pkg
+    5. Launch app
     """
     pkg_short = package.split('.')[-1]
     print(f"\n    --- [{pkg_short}] START ---")
@@ -1681,9 +1835,10 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
     db_path = get_cookie_db_path(package)
     app_storage_path = get_app_storage_path(package)
     backup_db = f"{BACKUP_DIR}/app_webview/Default/Cookies"
+    backup_webview = f"{BACKUP_DIR}/app_webview"
     backup_app_storage = get_backup_app_storage_path()
 
-    # Folder tmp di sdcard
+    # Folder tmp di sdcard (Python bisa akses)
     tmp_dir = f"{BACKUP_DIR}/tmp"
     tmp_db = os.path.join(tmp_dir, f"Cookies_{pkg_short}.db")
     tmp_app_storage = os.path.join(tmp_dir, f"appStorage_{pkg_short}.json")
@@ -1691,24 +1846,13 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
     print(f"    [2] Creating tmp dir...", end=" ", flush=True)
     try:
         os.makedirs(tmp_dir, exist_ok=True)
-        print(f"OK ({tmp_dir})")
+        print(f"OK")
     except Exception as e:
         print(f"❌ {e}")
         return False
 
-    # Cek backup files exist
-    print(f"    [3] Checking backup files...", end=" ", flush=True)
-    if not os.path.exists(backup_db):
-        print(f"❌ Cookies.db not found at {backup_db}")
-        return False
-    print(f"OK (Cookies.db={os.path.getsize(backup_db)}b)", end="")
-    if os.path.exists(backup_app_storage):
-        print(f", appStorage={os.path.getsize(backup_app_storage)}b")
-    else:
-        print(f", appStorage=MISSING")
-
     # Validasi cookie (non-blocking)
-    print(f"    [4] Validating cookie...", end=" ", flush=True)
+    print(f"    [3] Validating cookie...", end=" ", flush=True)
     user_id = None
     username = None
     display_name = None
@@ -1724,15 +1868,29 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
         print(f"⚠️ Error: {e} (will inject anyway)")
 
     # Step 1: Force stop
-    print(f"    [5] Force stopping {pkg_short}...", end=" ", flush=True)
+    print(f"    [4] Force stopping {pkg_short}...", end=" ", flush=True)
     run_root_cmd(f"am force-stop {package}")
     time.sleep(1)
     print(f"OK")
 
-    # Step 2: Copy Cookies.db → edit → timpa
+    # Step 2: Copy SELURUH app_webview/ dari bangova ke pkg
+    print(f"    [5] Copying entire app_webview/ to pkg...", end=" ", flush=True)
+    dst_webview = f"/data/data/{package}/app_webview"
+    run_root_cmd(f"rm -rf {dst_webview}")
+    run_root_cmd(f"cp -a {backup_webview} {dst_webview}")
+    owner = get_pkg_owner(package)
+    if owner:
+        run_root_cmd(f"chown -R {owner} {dst_webview}")
+    verify_webview = run_root_cmd(f"ls {dst_webview}/Default/Cookies")
+    if verify_webview:
+        print(f"OK (owner={owner})")
+    else:
+        print(f"❌ Failed to copy app_webview")
+        return False
+
+    # Step 3: Edit Cookies.db — copy ke tmp, edit, timpa balik ke pkg
     print(f"    [6] Copying Cookies.db to tmp...", end=" ", flush=True)
     try:
-        # Pakai binary read/write — hindari permission error dari shutil.copy2
         with open(backup_db, "rb") as src:
             with open(tmp_db, "wb") as dst:
                 dst.write(src.read())
@@ -1751,27 +1909,19 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
         return False
     print(f"OK")
 
-    print(f"    [8] Copying edited DB to pkg...", end=" ", flush=True)
-    owner = get_pkg_owner(package)
-    print(f"owner={owner}", end=" ", flush=True)
-    dst_webview = f"/data/data/{package}/app_webview/Default"
-    run_root_cmd(f"mkdir -p {dst_webview}")
+    print(f"    [8] Replacing Cookies.db in pkg...", end=" ", flush=True)
     run_root_cmd(f"cp {tmp_db} {db_path}")
     if owner:
-        run_root_cmd(f"chown -R {owner} /data/data/{package}/app_webview")
+        run_root_cmd(f"chown {owner} {db_path}")
     run_root_cmd(f"chmod 600 {db_path}")
-    # Verify
-    verify = run_root_cmd(f"ls -la {db_path}")
-    if verify:
-        print(f"OK")
-    else:
-        print(f"⚠️ verify failed but continuing")
+    verify_db = run_root_cmd(f"ls {db_path}")
+    print(f"OK" if verify_db else f"⚠️ verify failed")
     try:
         os.remove(tmp_db)
     except:
         pass
 
-    # Step 3: appStorage.json
+    # Step 4: appStorage.json — copy ke tmp, edit, timpa ke pkg
     if os.path.exists(backup_app_storage):
         print(f"    [9] Copying appStorage.json to tmp...", end=" ", flush=True)
         try:
@@ -1819,21 +1969,18 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
             except Exception as e:
                 print(f"⚠️ {e} (using backup as-is)")
         elif tmp_app_storage:
-            print(f"    [10] Skipping appStorage edit (no user info from validation)")
+            print(f"    [10] Skipping appStorage edit (no user info)")
 
         if tmp_app_storage and os.path.exists(tmp_app_storage):
-            print(f"    [11] Copying appStorage to pkg...", end=" ", flush=True)
+            print(f"    [11] Replacing appStorage in pkg...", end=" ", flush=True)
             app_storage_dir = os.path.dirname(app_storage_path)
             run_root_cmd(f"mkdir -p {app_storage_dir}")
             run_root_cmd(f"cp {tmp_app_storage} {app_storage_path}")
             if owner:
                 run_root_cmd(f"chown {owner} {app_storage_path}")
             run_root_cmd(f"chmod 660 {app_storage_path}")
-            verify2 = run_root_cmd(f"ls {app_storage_path}")
-            if verify2:
-                print(f"OK")
-            else:
-                print(f"⚠️ verify failed")
+            verify_as = run_root_cmd(f"ls {app_storage_path}")
+            print(f"OK" if verify_as else f"⚠️ verify failed")
             try:
                 os.remove(tmp_app_storage)
             except:
@@ -1841,9 +1988,9 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
     else:
         print(f"    [9] No appStorage.json in backup, skipped")
 
-    print(f"    ✅ Cookie injected to {pkg_short}")
+    print(f"    ✅ Done: {pkg_short}")
 
-    # Step 4: Launch app
+    # Step 5: Launch app (hanya buka Roblox home)
     if launch_after:
         print(f"    [12] Launching {pkg_short}...", end=" ", flush=True)
         splash_cmds = [
@@ -1860,7 +2007,7 @@ def inject_cookie_to_pkg(package, cookie, launch_after=False, game_id="", privat
                 launched = True
                 break
         if not launched:
-            print(f"⚠️ All methods tried, app may not have started")
+            print(f"⚠️ All methods tried")
 
     print(f"    --- [{pkg_short}] END ---\n")
     return True
@@ -3312,7 +3459,13 @@ def menu():
         print("🤖 ROBLOX MULTI-PACKAGE MANAGER (Termux/Cloudphone) v2")
         print("=" * 70)
         print(f"🎮 Game ID      : {cfg.get('game_id', 'Not set')}")
-        print(f"⚡ Executor     : {cfg.get('executor', 'delta').upper()}")
+        executor_display = {
+            "delta": "DELTA (Per Package)",
+            "delta_global": "DELTA (Global Folder)",
+            "arceusx": "ARCEUS X",
+            "ronix": "RONIX"
+        }.get(cfg.get('executor', 'delta'), cfg.get('executor', 'delta').upper())
+        print(f"⚡ Executor     : {executor_display}")
         print(f"📦 Packages     : {len(pkgs)}")
         print(f"⏱️ First Check  : {cfg.get('first_check', 3)} minutes")
         
@@ -3329,7 +3482,7 @@ def menu():
         if pkgs:
             print("\n📋 Registered Packages:")
             for i, (pkg, info) in enumerate(pkgs.items(), 1):
-                if EXECUTOR_TYPE in ["arceusx", "ronix"]:
+                if EXECUTOR_TYPE in ["arceusx", "ronix", "delta_global"]:
                     scripts_count = len(list_executor_scripts(info))
                     print(f"  {i}. {info['username']} (📜:{scripts_count})")
                 else:
@@ -3348,6 +3501,7 @@ def menu():
         print("6. 📝 Add Script to ALL Packages")
         print("7. 🗑️ Delete Script from ALL Packages")
         print("8. 👁️ View Scripts in ALL Packages")
+        print("8a. 📂 View/Manage Workspace Files")
         print("-" * 40)
         print("9. 🗂️ Copy ALL Cache Files to ALL Packages")
         print("10. 📊 View Cache Folder Status")
@@ -3450,6 +3604,8 @@ def menu():
             delete_script_from_all_packages()
         elif c == "8":
             view_scripts_all_packages()
+        elif c == "8a":
+            view_workspace_files()
         elif c == "9":
             copy_license_to_all_packages()
         elif c == "10":
